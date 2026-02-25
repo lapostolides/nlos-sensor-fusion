@@ -1,0 +1,68 @@
+[tool.poetry]
+name = "cc_hardware"
+version = "0.0.0"
+authors = ["Camera Culture <a2cc@media.mit.edu>"]
+description = "CC Hardware"
+readme = "README.md"
+packages = [
+  { include = "cc_hardware", from = "pkgs/drivers" },
+  { include = "cc_hardware", from = "pkgs/tools" },
+  { include = "cc_hardware", from = "pkgs/utils" },
+  { include = "cc_hardware", from = "pkgs/algos" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+cc_hardware_drivers = { path = "pkgs/drivers", develop = true }
+cc_hardware_tools = { path = "pkgs/tools", develop = true }
+cc_hardware_utils = { path = "pkgs/utils", develop = true }
+cc_hardware_algos = { path = "pkgs/algos", develop = true }
+
+[tool.poetry.group.dev.dependencies]
+pip = "^24.2"
+black = "^24.8.0"
+flake8 = "^7.1.1"
+Flake8-pyproject = "^1.2.3"
+isort = "^5.13.2"
+pyright = "^1.1.381"
+pytest = "^8.3.3"
+pre-commit = "^3.8.0"
+
+[tool.poetry.group.docs.dependencies]
+sphinx = "7.2.6"
+furo = "2023.9.10"
+sphinx-autoapi = "3.0.0"
+sphinx-autobuild = "2021.3.14"
+myst-parser = "2.0.0"
+sphinxcontrib-googleanalytics = "0.4"
+
+[tool.black]
+line-length = 88
+target-version = ['py312']
+
+[tool.pylint."messages control"]
+ignore = ["setup.py", "__init__.py"]
+disable = "all"
+enable = [
+  "empty-docstring",
+  "missing-class-docstring",
+  "missing-function-docstring",
+  "missing-module-docstring",
+]
+
+[tool.isort]
+profile = "black"
+known_first_party = ["cc_hardware"] # see package configuration below
+
+[tool.ruff]
+line-length = 88
+
+[tool.poetry-monorepo-dependency-plugin]
+enable = true
+
+[tool.setuptools_scm]
+write_to = "cc_hardware/_version.py"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

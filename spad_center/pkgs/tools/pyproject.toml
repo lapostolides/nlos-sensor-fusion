@@ -1,0 +1,27 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cc_hardware_tools"
+version = "0.0"
+authors = ["Camera Culture <a2cc@media.mit.edu>"]
+description = "CC Hardware Tools"
+readme = "README.md"
+packages = [
+  { include = "cc_hardware" }
+]
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+typer = "^0.13.1"
+pyqtgraph = "^0.13.7"
+PyQt6 = "=6.7.1"
+dash = "^2.18.2"
+PyOpenGL = "^3.1.7"
+# PyOpenGL_accelerate = "^3.1.7"
+cc_hardware_utils = {path = "../utils", develop = true}
+cc_hardware_drivers = {path = "../drivers", develop = true}
+
+[tool.poetry.scripts]
+cc_tools = "cc_hardware.tools:main"

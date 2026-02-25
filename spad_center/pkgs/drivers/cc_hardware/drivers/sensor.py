@@ -1,0 +1,136 @@
+"""Base classes for sensors and sensor data processing."""
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+from cc_hardware.utils import Component, Config, config_wrapper
+from cc_hardware.utils.logger import get_logger
+from cc_hardware.utils.setting import Setting
+
+
+@config_wrapper
+class SensorConfig(Config):
+    """Configuration for sensors.
+
+    When defining a new sensor, create a subclass of this configuration class
+    and add any necessary parameters.
+
+    Attributes:
+        settings (dict[str, Setting]): A dictionary of settings for the stepper motor.
+            These are used for UI elements. Actual settings should be defined
+            within the subclass.
+    """
+
+    @property
+    def settings(self) -> dict[str, Setting]:
+        """Retrieves the sensor settings."""
+        return {}
+
+
+class Sensor[T: SensorConfig](Component[T]):
+    """Abstract base class for sensors.
+
+    Args:
+        config (SensorConfig): The sensor configuration.
+    """
+
+    def __init__(self, config: T):
+        super().__init__(config)
+
+    @property
+    def settings(self) -> dict[str, Setting]:
+        """Retrieves the sensor settings."""
+        return self.config.settings
+
+    def reset(self, **kwargs) -> None:
+        """
+        Resets the sensor configuration to its initial state. This method can be
+        overridden by subclasses to implement specific reset behavior.
+
+        Args:
+            **kwargs: Additional parameters that may be used for resetting.
+        """
+        pass
+
+    def update(self, **kwargs) -> bool:
+        """
+        Updates the sensor configuration with provided keyword arguments. If there are
+        any changes given via the kwargs or in the settings, the configuration is sent
+        to the sensor.
+
+        Args:
+            **kwargs: Configuration parameters to update. Keys must match
+                the fields of SensorConfig.
+
+        Returns:
+            bool: True if the configuration was updated. False if no changes were made.
+        """
+        dirty = False
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+                dirty = True
+            else:
+                get_logger().warning(f"Unknown config key: {key}")
+
+        for name, setting in self.settings.items():
+            if setting.dirty:
+                dirty = True
+                setattr(self.config, name, setting.value)
+                setting.dirty = False
+
+        return dirty
+
+    @property
+    @abstractmethod
+    def is_okay(self) -> bool:
+        """Checks if the sensor is operational."""
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Closes the sensor and releases any resources."""
+        pass
+
+    def calibrate(self) -> bool:
+        """Calibrates the sensor."""
+        raise NotImplementedError("Calibration is not supported for this sensor.")
+
+    def __del__(self):
+        """Destructor to ensure the sensor is properly closed."""
+        try:
+            self.close()
+        except Exception:
+            get_logger().exception(f"Failed to close {self.__class__.__name__}.")
+
+
+class SensorData(ABC):
+    """Abstract base class for handling sensor data."""
+
+    def __init__(self):
+        self._data: Any = None
+        self._ready_data: Any = None
+
+    def reset(self) -> None:
+        """Resets the sensor data to its initial state."""
+        pass
+
+    @abstractmethod
+    def process(self, data: list[Any]) -> None:
+        """Processes a new row of data.
+
+        Args:
+          data (Any): Sensor data to process.
+        """
+        pass
+
+    def get_data(self, *, verify_has_data: bool = True) -> Any:
+        """Retrieves the processed sensor data."""
+        assert not verify_has_data or self.has_data, "No data available."
+        return self._ready_data
+
+    @property
+    @abstractmethod
+    def has_data(self) -> bool:
+        """Checks if there is any processed data available."""
+        pass

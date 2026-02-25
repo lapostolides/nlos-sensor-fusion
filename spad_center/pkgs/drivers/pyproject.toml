@@ -1,0 +1,27 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cc_hardware_drivers"
+version = "0.0"
+authors = ["Camera Culture <a2cc@media.mit.edu>"]
+description = "CC Hardware Drivers"
+readme = "README.md"
+packages = [
+    { include = "cc_hardware" }
+]
+include = [
+    { path = "./cc_hardware/drivers/data" }
+]
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+numpy = ">=1.26.4, <2.0.0"
+setuptools = "^75.5.0"
+cloudpickle = "^3.1.0"
+pylablib-lightweight = "^1.4.3"
+numba = "^0.60.0"
+telemetrix = { git = "https://github.com/AaronYoung5/telemetrix.git", rev = "4f9377cd1d58fa07075407583791610968cabc83" }
+cc_hardware_utils = { path = "../utils", develop = true }
+pyopengl = { version = "^3.1.9", optional = true }
