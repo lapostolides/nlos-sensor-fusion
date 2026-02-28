@@ -392,6 +392,37 @@ def validate_depth_maps(depth_dir: Path, kind: str, n_sample: int = 5, fatal: bo
         print(f"  [depth check] WARNING: {msg}")
 
 
+def clip_depth_maps(depth_dir: Path, kind: str, depth_min: float, depth_max: float) -> None:
+    """Zero out pixels outside [depth_min, depth_max] in all *.{kind}.bin depth maps.
+
+    COLMAP's PatchMatchStereo depth_min/max only set the search range initialisation;
+    without filtering, values can drift well outside that range.  This hard-clips the
+    maps so that stereo_fusion only fuses points within the specified depth window.
+    Applied to the GEOMETRIC maps after pass 2 so that the geometric consistency
+    computation still sees the full depth range (clipping photometric maps early breaks
+    the consistency check and causes geometric maps to be all-zero).
+    """
+    maps = sorted(depth_dir.glob(f"*.{kind}.bin"))
+    if not maps:
+        print(f"  [clip] No {kind} depth maps found in {depth_dir} — skipping.")
+        return
+    clipped_pixels = 0
+    total_pixels = 0
+    for p in maps:
+        raw = p.read_bytes()
+        header_end = raw.index(b'&', raw.index(b'&', raw.index(b'&') + 1) + 1) + 1
+        w, h, _ = (int(x) for x in raw[:header_end].decode().strip('&').split('&'))
+        data = np.frombuffer(raw[header_end:], dtype=np.float32).reshape(h, w).copy()
+        mask = (data > 0) & ((data < depth_min) | (data > depth_max))
+        clipped_pixels += int(mask.sum())
+        total_pixels += int((data > 0).sum())
+        data[mask] = 0.0
+        p.write_bytes(raw[:header_end] + data.tobytes())
+    pct = 100.0 * clipped_pixels / total_pixels if total_pixels else 0
+    print(f"  [clip] {kind}: clipped {clipped_pixels:,}/{total_pixels:,} valid pixels "
+          f"({pct:.1f}%) outside [{depth_min}, {depth_max}]m across {len(maps)} maps")
+
+
 def run_dense() -> None:
     """Run Multi-View Stereo (dense reconstruction) on top of the sparse model."""
     DENSE_DIR.mkdir(parents=True, exist_ok=True)
@@ -411,12 +442,14 @@ def run_dense() -> None:
     # NCC-based filtering (filter=1) rejects all pixels on textureless surfaces
     # (plain walls, ceilings, floors).  We disable it here and rely on geometric
     # consistency in pass 2 to filter out bad depth estimates.
+    # No depth_min/depth_max: let COLMAP auto-estimate per-image depth ranges from
+    # the sparse model.  Providing explicit global constraints (e.g. depth_max=6.0)
+    # clips per-image ranges for images whose sparse depth_max exceeds 6m, which
+    # creates artificial depth boundary artefacts that break the geometric pass.
     run(["colmap", "patch_match_stereo",
          "--workspace_path", str(DENSE_DIR),
          "--PatchMatchStereo.geom_consistency", "0",
          "--PatchMatchStereo.filter", "0",
-         "--PatchMatchStereo.depth_min", "0.1",
-         "--PatchMatchStereo.depth_max", "6.0",
          ],
         label="6a/7 patch_match_stereo (photometric)")
     validate_depth_maps(depth_dir, "photometric")
@@ -428,6 +461,12 @@ def run_dense() -> None:
     # rejects nearly everything.  3.0 allows modest noise while filtering outliers.
     # Similarly, dropping filter_min_ncc to 0 and triangulation angle to 0.5° avoids
     # incorrectly rejecting pixels based on photometric criteria that fail on plain walls.
+    # NOTE: do NOT set depth_min/depth_max here.  The geometric pass needs the full
+    # depth range to correctly reproject far-wall pixels into neighbouring views and
+    # compute consistency costs.  Specifying depth_max=6.0 causes the pass to search
+    # within [0.1, 6.0]m while photometric priors are up to 381m, so the cost for
+    # every pixel exceeds filter_geom_consistency_max_cost → all geometric maps zeroed.
+    # The depth range is enforced by clipping the GEOMETRIC maps after this pass.
     run(["colmap", "patch_match_stereo",
          "--workspace_path", str(DENSE_DIR),
          "--PatchMatchStereo.geom_consistency", "1",
@@ -435,11 +474,15 @@ def run_dense() -> None:
          "--PatchMatchStereo.filter_min_ncc", "0.0",
          "--PatchMatchStereo.filter_min_triangulation_angle", "0.5",
          "--PatchMatchStereo.filter_geom_consistency_max_cost", "30.0",
-         "--PatchMatchStereo.depth_min", "0.1",
-         "--PatchMatchStereo.depth_max", "6.0",
          ],
         label="6b/7 patch_match_stereo (geometric)")
     validate_depth_maps(depth_dir, "geometric", fatal=False)
+
+    # Hard-clip geometric maps to [0.1, 6.0]m before fusion to remove far-field noise.
+    # Clipping happens here (after both passes) so that the geometric consistency
+    # computation above sees the full depth range.  Clipping photometric maps earlier
+    # invalidates far-wall regions and causes the geometric pass to zero out everything.
+    clip_depth_maps(depth_dir, kind="geometric", depth_min=0.1, depth_max=6.0)
 
     run(["colmap", "stereo_fusion",
          "--workspace_path", str(DENSE_DIR),

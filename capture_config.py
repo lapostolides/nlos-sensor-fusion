@@ -4,7 +4,7 @@ OBJECT = "test"
 
 # ── Sensor Toggles ─────────────────────────────────────────────────────
 USE_SPAD = True
-USE_REALSENSE = False
+USE_REALSENSE = True
 # USE_THERMAL = False  # future
 # USE_UWB = False      # future
 
@@ -15,10 +15,11 @@ CAPTURE_MODE = "loop"
 
 # ── Live Preview ───────────────────────────────────────────────────────
 SHOW_SPAD_DASHBOARD = True    # PyQtGraph histogram dashboard
-SHOW_REALSENSE_PREVIEW = False # OpenCV RGB + depth preview window
+SHOW_REALSENSE_PREVIEW = True # OpenCV RGB + depth preview window
 
 # ── SPAD (VL53L8CH) ───────────────────────────────────────────────────
 SPAD_RESOLUTION = "4x4"  # "8x8" or "4x4"
+SPAD_PORT = "COM4"  # Set explicit port on Windows to avoid auto-detect mismatch
 
 # ── RealSense RGB-D ───────────────────────────────────────────────────
 RS_WIDTH = 848

@@ -18,6 +18,7 @@ from pathlib import Path
 from datetime import datetime
 
 from cc_hardware.drivers.spads import SPADSensor
+from cc_hardware.drivers.spads.spad_wrappers import SPADMergeWrapperConfig
 from cc_hardware.drivers.spads.vl53l8ch import VL53L8CHConfig8x8, VL53L8CHConfig4x4
 from cc_hardware.tools.dashboard.spad_dashboard.pyqtgraph import PyQtGraphDashboardConfig
 from cc_hardware.utils.file_handlers import PklHandler
@@ -29,13 +30,18 @@ NOW = datetime.now()
 LOGDIR = Path("data/logs") / NOW.strftime("%Y-%m-%d") / NOW.strftime("%H-%M-%S")
 
 SPAD_CONFIGS = {"8x8": VL53L8CHConfig8x8, "4x4": VL53L8CHConfig4x4}
+REALSENSE_WINDOW = "RealSense RGB+Depth"
 
 
 # ── Sensor Setup ───────────────────────────────────────────────────────
 
 def setup_spad(manager: Manager) -> dict:
     """Init VL53L8CH SPAD sensor + optional live dashboard. Returns metadata."""
-    config = SPAD_CONFIGS[cfg.SPAD_RESOLUTION].create()
+    wrapped_config = SPAD_CONFIGS[cfg.SPAD_RESOLUTION].create(port=cfg.SPAD_PORT)
+    config = SPADMergeWrapperConfig.create(
+        wrapped=wrapped_config,
+        data_type="HISTOGRAM",
+    )
     sensor = SPADSensor.create_from_config(config)
     assert sensor.is_okay, "SPAD sensor failed to initialize"
     manager.add(spad=sensor)
@@ -52,11 +58,11 @@ def setup_spad(manager: Manager) -> dict:
         w.show()
 
     return {
-        "sensor": "VL53L8CH",
-        "resolution": f"{config.width}x{config.height}",
-        "ranging_frequency_hz": config.ranging_frequency_hz,
-        "integration_time_ms": config.integration_time_ms,
-        "num_bins": config.num_bins,
+        "sensor": "VL53L8CH (SPADMergeWrapper)",
+        "resolution": f"{wrapped_config.width}x{wrapped_config.height}",
+        "ranging_frequency_hz": wrapped_config.ranging_frequency_hz,
+        "integration_time_ms": wrapped_config.integration_time_ms,
+        "num_bins": wrapped_config.num_bins,
     }
 
 
@@ -67,8 +73,18 @@ def setup_realsense(manager: Manager) -> dict:
     rs_cfg.enable_stream(rs.stream.depth, cfg.RS_WIDTH, cfg.RS_HEIGHT, rs.format.z16, cfg.RS_FPS)
     rs_cfg.enable_stream(rs.stream.color, cfg.RS_WIDTH, cfg.RS_HEIGHT, rs.format.bgr8, cfg.RS_FPS)
     profile = pipeline.start(rs_cfg)
+    device = profile.get_device()
+    device_name = device.get_info(rs.camera_info.name)
+    serial_number = device.get_info(rs.camera_info.serial_number)
     align = rs.align(rs.stream.color)
     manager.add(rs_pipeline=pipeline, rs_align=align)
+
+    print(f"\033[1;34mRealSense connected: {device_name} (S/N: {serial_number})\033[0m")
+    if cfg.SHOW_REALSENSE_PREVIEW:
+        cv2.namedWindow(REALSENSE_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(REALSENSE_WINDOW, cfg.RS_WIDTH * 2, cfg.RS_HEIGHT)
+        cv2.moveWindow(REALSENSE_WINDOW, 10, 10)
+        print("\033[1;34mRealSense preview enabled (RGB + aligned depth).\033[0m")
 
     def _intrinsics(stream):
         i = profile.get_stream(stream).as_video_stream_profile().get_intrinsics()
@@ -76,6 +92,8 @@ def setup_realsense(manager: Manager) -> dict:
                 "model": str(i.model), "coeffs": i.coeffs}
 
     return {
+        "device_name": device_name,
+        "serial_number": serial_number,
         "resolution": [cfg.RS_WIDTH, cfg.RS_HEIGHT], "fps": cfg.RS_FPS,
         "intrinsics": {
             "depth": _intrinsics(rs.stream.depth),
@@ -114,23 +132,37 @@ def capture_frame(manager: Manager, idx: int) -> dict:
         pipeline = manager.components["rs_pipeline"]
         align = manager.components["rs_align"]
         frames = pipeline.wait_for_frames()
-        aligned = align.process(frames)
+        depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
+        if not depth_frame or not color_frame:
+            raise RuntimeError("RealSense returned empty color/depth frame")
 
-        raw_rgb = np.asanyarray(frames.get_color_frame().get_data())
-        aligned_depth = np.asanyarray(aligned.get_depth_frame().get_data())
+        aligned = align.process(frames)
+        aligned_depth_frame = aligned.get_depth_frame()
+        aligned_color_frame = aligned.get_color_frame()
+        if not aligned_depth_frame or not aligned_color_frame:
+            raise RuntimeError("RealSense alignment returned empty frame")
+
+        raw_rgb = np.asanyarray(color_frame.get_data())
+        aligned_depth = np.asanyarray(aligned_depth_frame.get_data())
+
+        if idx == 0:
+            print(
+                f"\033[1;34mRealSense streaming OK: RGB {raw_rgb.shape}, depth {aligned_depth.shape}\033[0m"
+            )
 
         record["realsense"] = {
-            "raw_depth": np.asanyarray(frames.get_depth_frame().get_data()),
+            "raw_depth": np.asanyarray(depth_frame.get_data()),
             "raw_rgb": raw_rgb,
             "aligned_depth": aligned_depth,
-            "aligned_rgb": np.asanyarray(aligned.get_color_frame().get_data()),
+            "aligned_rgb": np.asanyarray(aligned_color_frame.get_data()),
         }
 
         if cfg.SHOW_REALSENSE_PREVIEW:
             depth_colormap = cv2.applyColorMap(
                 cv2.convertScaleAbs(aligned_depth, alpha=0.03), cv2.COLORMAP_JET
             )
-            cv2.imshow("RealSense", np.hstack([raw_rgb, depth_colormap]))
+            cv2.imshow(REALSENSE_WINDOW, np.hstack([raw_rgb, depth_colormap]))
             cv2.waitKey(1)
 
     return record
@@ -186,6 +218,18 @@ def main():
     LOGDIR.mkdir(parents=True, exist_ok=True)
     output = LOGDIR / f"{cfg.OBJECT}_data.pkl"
     assert not output.exists(), f"{output} already exists"
+
+    print(
+        "\033[1;35mConfig:"
+        f" USE_SPAD={cfg.USE_SPAD},"
+        f" USE_REALSENSE={cfg.USE_REALSENSE},"
+        f" SHOW_REALSENSE_PREVIEW={cfg.SHOW_REALSENSE_PREVIEW}\033[0m"
+    )
+    if cfg.SHOW_REALSENSE_PREVIEW and not cfg.USE_REALSENSE:
+        print(
+            "\033[1;33mWarning: SHOW_REALSENSE_PREVIEW=True but USE_REALSENSE=False; "
+            "no RealSense stream will be shown.\033[0m"
+        )
 
     with Manager() as manager:
         metadata = {"object": cfg.OBJECT, "start_time": NOW.isoformat(), "sensors": {}}
