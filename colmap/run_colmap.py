@@ -415,6 +415,8 @@ def run_dense() -> None:
          "--workspace_path", str(DENSE_DIR),
          "--PatchMatchStereo.geom_consistency", "0",
          "--PatchMatchStereo.filter", "0",
+         "--PatchMatchStereo.depth_min", "0.1",
+         "--PatchMatchStereo.depth_max", "6.0",
          ],
         label="6a/7 patch_match_stereo (photometric)")
     validate_depth_maps(depth_dir, "photometric")
@@ -433,6 +435,8 @@ def run_dense() -> None:
          "--PatchMatchStereo.filter_min_ncc", "0.0",
          "--PatchMatchStereo.filter_min_triangulation_angle", "0.5",
          "--PatchMatchStereo.filter_geom_consistency_max_cost", "30.0",
+         "--PatchMatchStereo.depth_min", "0.1",
+         "--PatchMatchStereo.depth_max", "6.0",
          ],
         label="6b/7 patch_match_stereo (geometric)")
     validate_depth_maps(depth_dir, "geometric", fatal=False)
