@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """COLMAP pipeline with optional ArUco-based scale estimation.
 
-Reads images from data/test, runs sparse reconstruction, and estimates
-real-world scale if ArUco markers are detected.
+Reads images from a configurable directory (default: data/test), runs sparse
+reconstruction, and estimates real-world scale if ArUco markers are detected.
+
+All output (stdout + stderr) is tee'd to a timestamped log file inside the
+workspace so you can review or diff runs later.
+
+Usage:
+    python run_colmap.py
+    python run_colmap.py --image-dir data/testlaserroom/images_downsampled
+    python run_colmap.py --image-dir data/testlaserroom/images_downsampled \\
+                         --workspace data/testlaserroom/colmap_output
+    python run_colmap.py --image-dir data/testlaserroom/images_downsampled --no-dense
 """
 
+import argparse
+import re
 import sqlite3
 import subprocess
 import sys
@@ -13,21 +25,27 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from tqdm import tqdm
+
 import cv2
 import numpy as np
 from PIL import Image as PilImage
 
 ROOT = Path(__file__).parent
+# Defaults — overridden by CLI args in main()
 IMAGE_DIR = ROOT / "data/test"
 WORKSPACE = ROOT / "data/colmap_output"
 COLMAP_BIN = "C:/dev/bin/colmap.exe"  # override if not on PATH
 DB = WORKSPACE / "database.db"
 SPARSE_DIR = WORKSPACE / "sparse/0"
+DENSE_DIR = WORKSPACE / "dense"
 
 # Feature extraction / matching settings
 # COLMAP's recommended working resolution is 1600–3000px on the long edge.
 # Images above this are downscaled internally during extraction (originals untouched).
 COLMAP_MAX_IMAGE_SIZE = 2000
+# patch_match_stereo resolution cap — 2000px is safe on an 8 GB RTX 5070.
+DENSE_MAX_IMAGE_SIZE = 2000
 # Maximum matches the GPU can hold without OOM on an 8 GB card.
 # The brute-force buffer is max_num_matches² × 4 bytes; 32768² ≈ 4.3 GB fits, 49152² ≈ 9.7 GB does not.
 GPU_SAFE_MAX_MATCHES = 32768
@@ -35,6 +53,45 @@ GPU_SAFE_MAX_MATCHES = 32768
 # ArUco settings — adjust to your marker
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
 MARKER_SIZE_M = 0.10  # physical side length in meters
+
+
+# =============================================================================
+# Logging — tee all print() output to a file
+# =============================================================================
+
+class _Tee:
+    """Wraps a stream and mirrors writes to a log file."""
+
+    def __init__(self, stream, log_path: Path):
+        self._stream = stream
+        self._file = log_path.open("a", encoding="utf-8")
+
+    def write(self, data: str) -> int:
+        self._stream.write(data)
+        self._file.write(data)
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+    # Forward attribute access (e.g. isatty) to the real stream
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def setup_logging(workspace: Path) -> Path:
+    """Redirect stdout to tee into a timestamped log file.  Returns log path."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = workspace / f"colmap_{ts}.log"
+    tee = _Tee(sys.stdout, log_path)
+    sys.stdout = tee  # type: ignore[assignment]
+    print(f"  Logging to: {log_path}")
+    return log_path
 
 
 # =============================================================================
@@ -85,22 +142,52 @@ class _GpuMonitor:
                 pass
 
 
+# Regex patterns that COLMAP prints for each stage.
+# Each must have two capture groups: (current, total).
+_PROGRESS_PATTERNS: dict[str, re.Pattern] = {
+    "feature_extractor":  re.compile(r"Processed file \[(\d+)/(\d+)\]"),
+    "patch_match_stereo": re.compile(r"Processing view (\d+) / (\d+)"),
+    "stereo_fusion":      re.compile(r"Fusing image \[(\d+)/(\d+)\]"),
+    "image_undistorter":  re.compile(r"Undistorting image \[(\d+)/(\d+)\]"),
+}
+
+
+def _stage_key(label: str) -> str:
+    """Extract the bare stage name from a label like '5/7 image_undistorter'."""
+    return label.split()[-1] if label else ""
+
+
 def run(cmd: list[str], label: str = "") -> None:
     tag = f"[{label}] " if label else ""
     print(f"\n{'='*60}")
     print(f"{tag}$ {' '.join(cmd)}")
-    print(f"{'='*60}")
+    print(f"{'='*60}", flush=True)
     t0 = time.time()
     cmd[0] = COLMAP_BIN
+    pattern = _PROGRESS_PATTERNS.get(_stage_key(label))
     monitor = _GpuMonitor(interval=5.0)
     monitor.start()
+    bar: tqdm | None = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in proc.stdout:
-            print(line, end="", flush=True)
+            if pattern:
+                m = pattern.search(line)
+                if m:
+                    cur, total = int(m.group(1)), int(m.group(2))
+                    if bar is None:
+                        bar = tqdm(total=total, unit="img", desc=label,
+                                   dynamic_ncols=True, leave=True)
+                    bar.n = cur
+                    bar.refresh()
+                    continue  # suppress raw progress line; bar shows it
+            # Non-progress lines: print via tqdm.write so the bar isn't clobbered
+            (tqdm.write if bar else print)(line, end="")
         proc.wait()
     finally:
         monitor.stop()
+        if bar is not None:
+            bar.close()
     elapsed = time.time() - t0
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -152,6 +239,21 @@ def audit_images(image_dir: Path) -> None:
     print("---")
 
 
+def count_ply_points(ply_path: Path) -> int | None:
+    """Return the vertex count from a PLY file header."""
+    try:
+        with ply_path.open("rb") as f:
+            for raw in f:
+                line = raw.decode("ascii", errors="ignore").strip()
+                if line.startswith("element vertex"):
+                    return int(line.split()[-1])
+                if line == "end_header":
+                    break
+    except Exception:
+        pass
+    return None
+
+
 def summarize_reconstruction(sparse_dir: Path) -> None:
     """Parse the TXT sparse model and print a concise reconstruction summary."""
     cameras_txt = sparse_dir / "cameras.txt"
@@ -187,6 +289,13 @@ def summarize_reconstruction(sparse_dir: Path) -> None:
         print("  WARNING: no images registered — reconstruction failed entirely")
     if errors and np.median(errors) > 2.0:
         print("  WARNING: high reprojection error — reconstruction may be unreliable")
+
+    fused_ply = DENSE_DIR / "fused.ply"
+    if fused_ply.exists():
+        n_dense = count_ply_points(fused_ply)
+        size_mb = fused_ply.stat().st_size / 1e6
+        print(f"  Dense points      : {n_dense:,}" if n_dense is not None else "  Dense points      : unknown")
+        print(f"  Dense PLY size    : {size_mb:.1f} MB  ({fused_ply})")
     print("---\n")
 
 
@@ -233,7 +342,111 @@ def get_max_features_from_db(db_path: Path) -> int:
     return int(row[0]) if row and row[0] else 8192
 
 
-def run_colmap() -> None:
+def read_colmap_depth(path: Path) -> np.ndarray:
+    """Read a COLMAP binary depth map (ASCII header 'W&H&C&' + float32 data)."""
+    raw = path.read_bytes()
+    header_end = raw.index(b'&', raw.index(b'&', raw.index(b'&') + 1) + 1) + 1
+    w, h, _ = (int(x) for x in raw[:header_end].decode().strip('&').split('&'))
+    return np.frombuffer(raw[header_end:], dtype=np.float32).reshape(h, w)
+
+
+def validate_depth_maps(depth_dir: Path, kind: str, n_sample: int = 5, fatal: bool = True) -> None:
+    """Sample depth maps and report statistics. Raises RuntimeError if all zeros.
+
+    Args:
+        depth_dir: directory containing *.{kind}.bin files
+        kind:      'photometric' or 'geometric'
+        n_sample:  how many maps to sample
+        fatal:     if True (default) raise on all-zero; if False just warn and continue
+    """
+    maps = sorted(depth_dir.glob(f"*.{kind}.bin"))
+    if not maps:
+        raise RuntimeError(f"No {kind} depth maps found in {depth_dir}")
+
+    sample = maps[:n_sample]
+    total_valid = 0
+    total_pixels = 0
+    depth_min, depth_max = float("inf"), float("-inf")
+
+    for p in sample:
+        d = read_colmap_depth(p)
+        valid = d[d > 0]
+        total_valid += len(valid)
+        total_pixels += d.size
+        if len(valid):
+            depth_min = min(depth_min, float(valid.min()))
+            depth_max = max(depth_max, float(valid.max()))
+
+    pct = 100.0 * total_valid / total_pixels if total_pixels else 0
+    print(f"\n  [depth check] {kind}: sampled {len(sample)}/{len(maps)} maps  "
+          f"valid={pct:.1f}%  depth=[{depth_min:.2f}, {depth_max:.2f}]m")
+
+    if total_valid == 0:
+        msg = (
+            f"All {kind} depth maps are zero — patch_match_stereo produced no depth. "
+            "This can happen on textureless surfaces (plain walls, floors) where "
+            "photometric/geometric consistency filters reject all depth hypotheses."
+        )
+        if fatal:
+            raise RuntimeError(msg)
+        print(f"  [depth check] WARNING: {msg}")
+
+
+def run_dense() -> None:
+    """Run Multi-View Stereo (dense reconstruction) on top of the sparse model."""
+    DENSE_DIR.mkdir(parents=True, exist_ok=True)
+
+    run(["colmap", "image_undistorter",
+         "--image_path", str(IMAGE_DIR),
+         "--input_path", str(SPARSE_DIR),
+         "--output_path", str(DENSE_DIR),
+         "--output_type", "COLMAP",
+         "--max_image_size", str(DENSE_MAX_IMAGE_SIZE),
+         ],
+        label="5/7 image_undistorter")
+
+    depth_dir = DENSE_DIR / "stereo" / "depth_maps"
+
+    # Pass 1: photometric depth maps WITHOUT filtering.
+    # NCC-based filtering (filter=1) rejects all pixels on textureless surfaces
+    # (plain walls, ceilings, floors).  We disable it here and rely on geometric
+    # consistency in pass 2 to filter out bad depth estimates.
+    run(["colmap", "patch_match_stereo",
+         "--workspace_path", str(DENSE_DIR),
+         "--PatchMatchStereo.geom_consistency", "0",
+         "--PatchMatchStereo.filter", "0",
+         ],
+        label="6a/7 patch_match_stereo (photometric)")
+    validate_depth_maps(depth_dir, "photometric")
+
+    # Pass 2: geometric depth maps, using photometric output as initialisation.
+    # The default filter_geom_consistency_max_cost=1 is too strict for scenes with
+    # partially textureless surfaces (e.g. plain walls): a ~0.5m depth noise at 3m
+    # range with a 0.5m camera baseline causes ~28px reprojection error, so 1px
+    # rejects nearly everything.  3.0 allows modest noise while filtering outliers.
+    # Similarly, dropping filter_min_ncc to 0 and triangulation angle to 0.5° avoids
+    # incorrectly rejecting pixels based on photometric criteria that fail on plain walls.
+    run(["colmap", "patch_match_stereo",
+         "--workspace_path", str(DENSE_DIR),
+         "--PatchMatchStereo.geom_consistency", "1",
+         "--PatchMatchStereo.filter", "1",
+         "--PatchMatchStereo.filter_min_ncc", "0.0",
+         "--PatchMatchStereo.filter_min_triangulation_angle", "0.5",
+         "--PatchMatchStereo.filter_geom_consistency_max_cost", "30.0",
+         ],
+        label="6b/7 patch_match_stereo (geometric)")
+    validate_depth_maps(depth_dir, "geometric", fatal=False)
+
+    run(["colmap", "stereo_fusion",
+         "--workspace_path", str(DENSE_DIR),
+         "--input_type", "geometric",
+         "--output_path", str(DENSE_DIR / "fused.ply"),
+         "--StereoFusion.min_num_pixels", "3",
+         ],
+        label="7/7 stereo_fusion")
+
+
+def run_colmap(no_dense: bool = False) -> None:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     SPARSE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -252,30 +465,25 @@ def run_colmap() -> None:
          "--database_path", str(DB),
          "--image_path", str(IMAGE_DIR),
          "--ImageReader.single_camera", "1",
-         "--ImageReader.max_image_size", str(COLMAP_MAX_IMAGE_SIZE),
-         "--image_list_path", str(image_list),
-         "--SiftExtraction.use_gpu", "0",            # CPU enforces max_num_features; GPU ignores it
+         "--SiftExtraction.max_image_size", str(COLMAP_MAX_IMAGE_SIZE),
+         "--SiftExtraction.estimate_affine_shape", "1",
+         "--SiftExtraction.domain_size_pooling", "1",
          "--SiftExtraction.max_num_features", "16384",
-         "--SiftExtraction.domain_size_pooling", "1",  # better distinctiveness on repetitive textures
+         "--image_list_path", str(image_list),
          ],
-        label="1/4 feature_extractor")
-
-    # Use the actual max feature count from the DB to set the match buffer,
-    # capped at what the GPU can hold without OOM.
-    actual_max = get_max_features_from_db(DB)
-    max_matches = min(actual_max, GPU_SAFE_MAX_MATCHES)
-    print(f"  Max features in DB: {actual_max} → max_num_matches={max_matches}")
+        label="1/7 feature_extractor")
 
     run(["colmap", "exhaustive_matcher",
          "--database_path", str(DB),
-         "--FeatureMatching.max_num_matches", str(max_matches),
-         "--SiftMatching.guided_matching", "1",  # epipolar filtering reduces false matches
          ],
-        label="2/4 exhaustive_matcher")
+        label="2/7 exhaustive_matcher")
     run(["colmap", "mapper", "--database_path", str(DB), "--image_path", str(IMAGE_DIR), "--output_path", str(SPARSE_DIR.parent)],
-        label="3/4 mapper")
+        label="3/7 mapper")
     run(["colmap", "model_converter", "--input_path", str(SPARSE_DIR), "--output_path", str(SPARSE_DIR), "--output_type", "TXT"],
-        label="4/4 model_converter")
+        label="4/7 model_converter")
+
+    if not no_dense:
+        run_dense()
 
     summarize_reconstruction(SPARSE_DIR)
     print(f"\n{'#'*60}")
@@ -417,10 +625,44 @@ def estimate_scale(detections: dict[str, np.ndarray]) -> float | None:
 
 
 def main() -> None:
-    run_colmap()
+    global IMAGE_DIR, WORKSPACE, DB, SPARSE_DIR, DENSE_DIR
 
-    image_paths = sorted(IMAGE_DIR.iterdir())
-    detections = detect_aruco(image_paths)
+    parser = argparse.ArgumentParser(description="COLMAP sparse reconstruction pipeline")
+    parser.add_argument(
+        "--image-dir", type=Path,
+        default=ROOT / "data/test",
+        help="Directory containing input images (default: data/test)",
+    )
+    parser.add_argument(
+        "--workspace", type=Path,
+        default=None,
+        help="COLMAP workspace / output directory (default: <image-dir>/../colmap_output)",
+    )
+    parser.add_argument(
+        "--no-dense", action="store_true",
+        help="Skip dense MVS reconstruction (image_undistorter + patch_match_stereo + stereo_fusion)",
+    )
+    args = parser.parse_args()
+
+    IMAGE_DIR = args.image_dir.resolve()
+    WORKSPACE = (args.workspace or IMAGE_DIR.parent / "colmap_output").resolve()
+    DB = WORKSPACE / "database.db"
+    SPARSE_DIR = WORKSPACE / "sparse/0"
+    DENSE_DIR = WORKSPACE / "dense"
+
+    log_path = setup_logging(WORKSPACE)
+
+    print(f"  Image dir : {IMAGE_DIR}")
+    print(f"  Workspace : {WORKSPACE}")
+    print(f"  Log file  : {log_path}")
+
+    run_colmap(no_dense=args.no_dense)
+
+    image_paths = sorted(
+        p for p in IMAGE_DIR.iterdir()
+        if p.suffix.lower() in (".jpg", ".jpeg", ".png")
+    )
+    detections = detect_aruco_cc_hardware(image_paths)
 
     if detections:
         print(f"ArUco markers detected in {len(detections)} image(s).")

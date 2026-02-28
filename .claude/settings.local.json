@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(\"/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin/nvcc.exe\":*)",
+      "Bash(find:*)",
+      "Bash(export:*)",
+      "Bash(conda run:*)",
+      "Bash(conda search:*)",
+      "Bash(winget search:*)",
+      "Bash(ls:*)",
+      "Bash(powershell.exe:*)",
+      "Bash(\"C:/Users/lapos/miniconda3/envs/sensor-fusion/python.exe\":*)",
+      "Bash(\"C:/Users/lapos/miniconda3/envs/sensor-fusion/Library/bin/colmap.exe\":*)"
+    ]
+  }
+}
