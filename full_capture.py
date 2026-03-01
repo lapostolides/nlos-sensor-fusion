@@ -452,6 +452,9 @@ def main():
                 cv2.moveWindow(SENSOR_CAM_WINDOW, 10, 10)
             if cfg.SHOW_OVERHEAD_CAM_PREVIEW:
                 cv2.namedWindow(OVERHEAD_CAM_WINDOW, cv2.WINDOW_NORMAL)
+                _ov_w = cfg.OVERHEAD_CAM_WIDTH  // 2
+                _ov_h = cfg.OVERHEAD_CAM_HEIGHT // 2
+                cv2.resizeWindow(OVERHEAD_CAM_WINDOW, _ov_w, _ov_h)
                 cv2.moveWindow(OVERHEAD_CAM_WINDOW, 10, 10 + cfg.SENSOR_CAM_HEIGHT + 40)
 
             writer = PklHandler(output)
