@@ -215,6 +215,12 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Weights & Biases
+wandb/
+.netrc
+
+# ML Training
+checkpoints/
 
 # Data
 data/
