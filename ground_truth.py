@@ -2,14 +2,22 @@
 Ground truth person detection from RGB camera frames using YOLO.
 """
 
+import pickle
 from dataclasses import dataclass
-from typing import List, Optional
+from pathlib import Path
+from typing import Iterator, List, Optional
 
 import numpy as np
 from ultralytics import YOLO
 
 # COCO class ID for person
 PERSON_CLASS_ID = 0
+
+# Camera key used to extract ground truth frames from PKL log records.
+# Currently points to the tracking RealSense (the scene-facing camera).
+# Once the dedicated ground truth camera is added to the capture pipeline,
+# change this to "ground_truth_realsense_data".
+GT_CAMERA_KEY = "tracking_realsense_data"
 
 
 @dataclass
@@ -91,3 +99,53 @@ class GroundTruthDetector:
             )
 
         return locations
+
+
+@dataclass
+class LogDetection:
+    """Detection results for one iteration in a PKL log file."""
+
+    iter: int
+    locations: List[PersonLocation]
+    frame: np.ndarray  # the BGR frame used for detection
+
+
+def iter_log(
+    pkl_path: Path | str,
+    detector: GroundTruthDetector,
+    camera_key: str = GT_CAMERA_KEY,
+    normalized: bool = False,
+) -> Iterator[LogDetection]:
+    """
+    Iterate over records in a PKL log file and yield person detections.
+
+    Skips the metadata record (first entry). Each subsequent record contains
+    SPAD data plus one or more camera frames; detection runs on the frame
+    identified by ``camera_key``.
+
+    Args:
+        pkl_path: Path to the .pkl log file produced by a capture script.
+        detector: GroundTruthDetector instance to use for detection.
+        camera_key: Key in each record for the camera data to detect from.
+                    Defaults to GT_CAMERA_KEY. Update to
+                    "ground_truth_realsense_data" once the new camera is
+                    integrated into the capture pipeline.
+        normalized: If True, return coordinates in [0, 1] range.
+
+    Yields:
+        LogDetection with the iteration index, detected locations, and frame.
+    """
+    with open(Path(pkl_path), "rb") as f:
+        while True:
+            try:
+                record = pickle.load(f)
+            except EOFError:
+                break
+            if "metadata" in record:
+                continue
+            frame = record[camera_key]["aligned_rgb_image"]
+            yield LogDetection(
+                iter=record["iter"],
+                locations=detector.process(frame, normalized=normalized),
+                frame=frame,
+            )
