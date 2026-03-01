@@ -3,8 +3,9 @@
 OBJECT = "test"
 
 # ── Sensor Toggles ─────────────────────────────────────────────────────
-USE_SPAD = True
-USE_REALSENSE = True
+USE_SPAD         = True
+USE_SENSOR_CAM   = True   # Intel RealSense RGB-D
+USE_OVERHEAD_CAM = True  # eMeet C960 USB webcam (RGB only, no depth)
 # USE_THERMAL = False  # future
 # USE_UWB = False      # future
 
@@ -14,14 +15,22 @@ USE_REALSENSE = True
 CAPTURE_MODE = "loop"
 
 # ── Live Preview ───────────────────────────────────────────────────────
-SHOW_SPAD_DASHBOARD = True    # PyQtGraph histogram dashboard
-SHOW_REALSENSE_PREVIEW = True # OpenCV RGB + depth preview window
+SHOW_SPAD_DASHBOARD      = True   # PyQtGraph histogram dashboard
+SHOW_SENSOR_CAM_PREVIEW  = True   # OpenCV RGB + depth preview window
+SHOW_OVERHEAD_CAM_PREVIEW = True  # OpenCV RGB preview window for eMeet C960
 
 # ── SPAD (VL53L8CH) ───────────────────────────────────────────────────
 SPAD_RESOLUTION = "4x4"  # "8x8" or "4x4"
 SPAD_PORT = "COM4"  # Set explicit port on Windows to avoid auto-detect mismatch
 
-# ── RealSense RGB-D ───────────────────────────────────────────────────
-RS_WIDTH = 848
-RS_HEIGHT = 480
-RS_FPS = 30
+# ── sensor_cam (RealSense RGB-D) ───────────────────────────────────────
+SENSOR_CAM_WIDTH  = 848
+SENSOR_CAM_HEIGHT = 480
+SENSOR_CAM_FPS    = 30
+
+# ── overhead_cam (eMeet C960 USB webcam) ──────────────────────────────
+# Identified by Windows device name — plug order does not matter.
+# Change this string if a different USB camera is used.
+OVERHEAD_CAM_NAME   = "eMeet C960"
+OVERHEAD_CAM_WIDTH  = 1920   # 1920x1080 uses the full sensor; default was 640x480
+OVERHEAD_CAM_HEIGHT = 1080
