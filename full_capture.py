@@ -49,14 +49,14 @@ class LatestFrame:
     def __init__(self):
         self._lock = threading.Lock()
         self._data = None
-        self._timestamp: float | None = None
+        self._timestamp: str | None = None
         self._has_new = threading.Event()
 
     def put(self, data):
         """Store a new frame (called from worker thread)."""
         with self._lock:
             self._data = data
-            self._timestamp = time.perf_counter()
+            self._timestamp = datetime.now().isoformat()
         self._has_new.set()
 
     def get(self):
@@ -264,22 +264,30 @@ def run_loop(manager: Manager, writer: PklHandler,
     logged_rs = False
     try:
         while True:
-            paced, _ = pace_buf.wait_for_new(timeout=2.0)
+            paced, paced_ts = pace_buf.wait_for_new(timeout=2.0)
             if paced is None:
                 continue
 
-            record = {"iter": idx, "timestamp": datetime.now().isoformat()}
-            spad_data = rs_data = None
+            record = {"iter": idx}
+            spad_data = spad_ts = rs_data = rs_ts = None
 
             if cfg.USE_SPAD:
-                spad_data = paced if pace_buf is spad_buf else spad_buf.get()[0]
+                if pace_buf is spad_buf:
+                    spad_data, spad_ts = paced, paced_ts
+                else:
+                    spad_data, spad_ts = spad_buf.get()
                 if spad_data is not None:
                     record["spad"] = spad_data
+                    record["spad_timestamp"] = spad_ts
 
             if cfg.USE_REALSENSE:
-                rs_data = paced if pace_buf is rs_buf else rs_buf.get()[0]
+                if pace_buf is rs_buf:
+                    rs_data, rs_ts = paced, paced_ts
+                else:
+                    rs_data, rs_ts = rs_buf.get()
                 if rs_data is not None:
                     record["realsense"] = rs_data
+                    record["realsense_timestamp"] = rs_ts
                     if not logged_rs:
                         print(
                             f"\033[1;34mRealSense streaming OK: "
@@ -321,20 +329,22 @@ def run_manual(manager: Manager, writer: PklHandler,
             if cmd == "q":
                 break
 
-            record = {"iter": idx, "timestamp": datetime.now().isoformat()}
+            record = {"iter": idx}
             spad_data = rs_data = None
 
             if cfg.USE_SPAD:
-                spad_data, _ = spad_buf.get()
+                spad_data, spad_ts = spad_buf.get()
                 if spad_data is not None:
                     record["spad"] = spad_data
+                    record["spad_timestamp"] = spad_ts
                 else:
                     print("  \033[1;33mWarning: no SPAD data yet\033[0m")
 
             if cfg.USE_REALSENSE:
-                rs_data, _ = rs_buf.get()
+                rs_data, rs_ts = rs_buf.get()
                 if rs_data is not None:
                     record["realsense"] = rs_data
+                    record["realsense_timestamp"] = rs_ts
                 else:
                     print("  \033[1;33mWarning: no RealSense data yet\033[0m")
 

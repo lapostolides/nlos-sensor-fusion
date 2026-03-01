@@ -508,26 +508,31 @@ def run_colmap(no_dense: bool = False) -> None:
     audit_images(IMAGE_DIR)
     image_list = write_image_list(IMAGE_DIR, WORKSPACE)
 
-    run(["colmap", "feature_extractor",
-         "--database_path", str(DB),
-         "--image_path", str(IMAGE_DIR),
-         "--ImageReader.single_camera", "1",
-         "--SiftExtraction.max_image_size", str(COLMAP_MAX_IMAGE_SIZE),
-         "--SiftExtraction.estimate_affine_shape", "1",
-         "--SiftExtraction.domain_size_pooling", "1",
-         "--SiftExtraction.max_num_features", "16384",
-         "--image_list_path", str(image_list),
-         ],
-        label="1/7 feature_extractor")
+    sparse_exists = (SPARSE_DIR / "cameras.bin").exists()
+    if sparse_exists:
+        print(f"\n  Sparse model already exists at {SPARSE_DIR} — skipping stages 1-4.")
+        print(f"  (Delete {SPARSE_DIR} to force re-reconstruction.)")
+    else:
+        run(["colmap", "feature_extractor",
+             "--database_path", str(DB),
+             "--image_path", str(IMAGE_DIR),
+             "--ImageReader.single_camera", "1",
+             "--SiftExtraction.max_image_size", str(COLMAP_MAX_IMAGE_SIZE),
+             "--SiftExtraction.estimate_affine_shape", "1",
+             "--SiftExtraction.domain_size_pooling", "1",
+             "--SiftExtraction.max_num_features", "16384",
+             "--image_list_path", str(image_list),
+             ],
+            label="1/7 feature_extractor")
 
-    run(["colmap", "exhaustive_matcher",
-         "--database_path", str(DB),
-         ],
-        label="2/7 exhaustive_matcher")
-    run(["colmap", "mapper", "--database_path", str(DB), "--image_path", str(IMAGE_DIR), "--output_path", str(SPARSE_DIR.parent)],
-        label="3/7 mapper")
-    run(["colmap", "model_converter", "--input_path", str(SPARSE_DIR), "--output_path", str(SPARSE_DIR), "--output_type", "TXT"],
-        label="4/7 model_converter")
+        run(["colmap", "exhaustive_matcher",
+             "--database_path", str(DB),
+             ],
+            label="2/7 exhaustive_matcher")
+        run(["colmap", "mapper", "--database_path", str(DB), "--image_path", str(IMAGE_DIR), "--output_path", str(SPARSE_DIR.parent)],
+            label="3/7 mapper")
+        run(["colmap", "model_converter", "--input_path", str(SPARSE_DIR), "--output_path", str(SPARSE_DIR), "--output_type", "TXT"],
+            label="4/7 model_converter")
 
     if not no_dense:
         run_dense()
