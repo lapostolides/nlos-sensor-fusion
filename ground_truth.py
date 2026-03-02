@@ -84,7 +84,7 @@ class GroundTruthDetector:
 
     def __init__(
         self,
-        model: str = "yolov8n.pt",
+        model: str = "models/yolov8n.pt",
         confidence_threshold: float = 0.3,
         device: Optional[str] = None,
     ):
@@ -295,12 +295,12 @@ def main() -> None:
         description="Run YOLO ground-truth detection on a capture PKL and save results."
     )
     parser.add_argument("pkl", nargs="?", help="Path to capture PKL file.")
-    parser.add_argument("--model", default="yolov8n.pt",
+    parser.add_argument("--model", default="models/yolov8n.pt",
                         help="YOLO model (default: yolov8n.pt).")
     parser.add_argument("--conf", type=float, default=0.3,
                         help="Detection confidence threshold (default: 0.3).")
     parser.add_argument("--pose", dest="pose_model", nargs="?",
-                        const="yolo11n-pose.pt", default=None,
+                        const="models/yolo11n-pose.pt", default=None,
                         metavar="MODEL",
                         help=(
                             "Enable pose classification.  Optionally provide a "

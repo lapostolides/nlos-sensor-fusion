@@ -252,7 +252,7 @@ class PoseClassifier:
 
     def __init__(
         self,
-        model:            str            = "yolo11n-pose.pt",
+        model:            str            = "models/yolo11n-pose.pt",
         crouch_threshold: float          = 0.55,
         arms_threshold:   float          = 0.45,
         still_disp_px:    float          = 8.0,
