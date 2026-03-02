@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -230,6 +231,7 @@ def play(
         rec = records[idx]
 
         # ── Build frames ──
+        t_render = time.perf_counter()
         info_lines = [
             f"frame {idx+1}/{n}",
             f"iter {rec.get('iter','?')}",
@@ -254,7 +256,8 @@ def play(
             cv2.imshow(OVERHEAD_WIN, frame_ov)
 
         # ── Keyboard ──
-        interval_ms = max(1, int(base_interval / speed * 1000))
+        render_ms   = (time.perf_counter() - t_render) * 1000
+        interval_ms = max(1, int(base_interval / speed * 1000) - int(render_ms))
         key = cv2.waitKey(interval_ms if not paused else 30) & 0xFF
 
         if key in (ord('q'), 27):           # q or Esc
