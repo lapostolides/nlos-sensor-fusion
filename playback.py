@@ -2,8 +2,11 @@
 """
 playback.py - Play back a recorded capture PKL file.
 
-Shows sensor_cam (RGB + depth) and overhead_cam side-by-side at the
-original capture rate.  Keyboard controls:
+Shows sensor_cam (RGB + depth) and overhead_cam at the original capture
+rate.  With --gt, YOLO detections are pre-computed and overlaid on the
+overhead_cam window.
+
+Keyboard controls:
 
     Space       pause / resume
     ,  /  .     step one frame backward / forward  (while paused)
@@ -11,7 +14,7 @@ original capture rate.  Keyboard controls:
     q  or Esc   quit
 
 Usage:
-    python playback.py [path/to/capture.pkl] [--speed 1.0]
+    python playback.py [path/to/capture.pkl] [--speed 1.0] [--gt]
 """
 
 import argparse
@@ -87,13 +90,85 @@ def build_overhead_cam_frame(rec: dict, display_w: int, display_h: int) -> np.nd
     return cv2.resize(rgb, (display_w, display_h))
 
 
+# ── Ground-truth I/O and overlay ──────────────────────────────────────────────
+
+def load_gt_for_playback(pkl_path: Path) -> dict[int, list] | None:
+    """
+    Load the sidecar _gt.json for *pkl_path*.  Returns None (with a hint)
+    if the file doesn't exist yet.
+    """
+    from ground_truth import load_gt
+    result = load_gt(pkl_path)
+    if result is None:
+        print(
+            f"\nNo GT file found for {pkl_path.name}.\n"
+            f"Run first:  python ground_truth.py {pkl_path}\n"
+        )
+    return result
+
+
+def _draw_detections(
+    img: np.ndarray,
+    locations: list,
+    src_w: int,
+    src_h: int,
+) -> np.ndarray:
+    """
+    Draw YOLO person detections onto *img*.
+
+    Pixel coordinates from the detector (src_w × src_h space) are scaled to
+    match the display image size, so this works regardless of resize factor.
+    """
+    out = img.copy()
+    dw, dh = out.shape[1], out.shape[0]
+    sx, sy = dw / src_w, dh / src_h
+
+    for loc in locations:
+        bx, by, bw, bh = loc.bbox
+        cx, cy = loc.center
+
+        x1 = int(bx * sx)
+        y1 = int(by * sy)
+        x2 = int((bx + bw) * sx)
+        y2 = int((by + bh) * sy)
+        pcx = int(cx * sx)
+        pcy = int(cy * sy)
+
+        # Bounding box
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # Centre crosshair
+        r = 6
+        cv2.line(out, (pcx - r, pcy), (pcx + r, pcy), (0, 255, 0), 2)
+        cv2.line(out, (pcx, pcy - r), (pcx, pcy + r), (0, 255, 0), 2)
+
+        # Label
+        tid = f"ID:{loc.track_id}" if loc.track_id is not None else "ID:?"
+        label = f"{tid}  {loc.confidence:.0%}"
+        lx, ly = x1, max(y1 - 6, 14)
+        cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 255, 0), 1, cv2.LINE_AA)
+
+    return out
+
+
+
+
 # ── Playback ──────────────────────────────────────────────────────────────────
 
 SENSOR_WIN  = "sensor_cam  [space=pause  , . = step  [ ] = speed  q=quit]"
 OVERHEAD_WIN = "overhead_cam"
 
 
-def play(records: list[dict], speed: float):
+def play(
+    records: list[dict],
+    speed: float,
+    detections: dict[int, list] | None = None,  # iter -> list[PersonLocation]
+    ov_src_w: int = 1920,
+    ov_src_h: int = 1080,
+):
     if not records:
         print("No data records found.")
         return
@@ -172,6 +247,10 @@ def play(records: list[dict], speed: float):
             frame_ov = build_overhead_cam_frame(rec, ov_disp_w, ov_disp_h)
             if frame_ov is None:
                 frame_ov = np.zeros((ov_disp_h, ov_disp_w, 3), dtype=np.uint8)
+            if detections is not None:
+                locs = detections.get(rec.get("iter", -1), [])
+                if locs:
+                    frame_ov = _draw_detections(frame_ov, locs, ov_src_w, ov_src_h)
             cv2.imshow(OVERHEAD_WIN, frame_ov)
 
         # ── Keyboard ──
@@ -211,6 +290,8 @@ def main():
     parser.add_argument("pkl", nargs="?", help="Path to capture PKL file.")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Playback speed multiplier (default 1.0).")
+    parser.add_argument("--gt", action="store_true",
+                        help="Overlay ground-truth detections from the _gt.json sidecar.")
     args = parser.parse_args()
 
     if args.pkl:
@@ -230,7 +311,18 @@ def main():
     records = load_records(path)
     print(f"Loaded {len(records)} data records.")
 
-    play(records, speed=args.speed)
+    detections: dict[int, list] | None = None
+    ov_src_w, ov_src_h = 1920, 1080
+    if args.gt:
+        ov_sample = next(
+            (r["overhead_cam"]["raw_rgb"] for r in records if "overhead_cam" in r), None
+        )
+        if ov_sample is not None:
+            ov_src_h, ov_src_w = ov_sample.shape[:2]
+        detections = load_gt_for_playback(path)
+
+    play(records, speed=args.speed, detections=detections,
+         ov_src_w=ov_src_w, ov_src_h=ov_src_h)
 
 
 if __name__ == "__main__":
