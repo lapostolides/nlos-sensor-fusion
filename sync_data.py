@@ -2,19 +2,18 @@
 """
 sync_data.py - Post-hoc temporal synchronization of SPAD and camera frames.
 
-Loads a capture PKL file, extracts SPAD and camera frames each with their own
-timestamps, and nearest-neighbour matches every SPAD frame to the closest
-camera frame. Extra camera frames remain unmatched. Warns about pairs that
-exceed MAX_DT_MS milliseconds.
+Loads a capture PKL file, extracts SPAD and per-camera timestamps, and
+nearest-neighbour matches every SPAD frame to the closest frame from each
+active camera independently.  Warns about pairs that exceed MAX_DT_MS ms.
 
-Supports two timestamp layouts:
-  - Shared:     {"iter":..., "timestamp":"...", "spad":..., "realsense":...}
-                (current full_capture.py format; both sensors share one timestamp)
-  - Per-sensor: {"iter":..., "spad":..., "spad_timestamp":"...",
-                              "realsense":..., "realsense_timestamp":"..."}
-                (future format; each sensor records its own capture time)
-  - Separate records are also handled: a record with only "spad" or only
-    "realsense" key uses its own "timestamp".
+Supported cameras (auto-detected from record keys):
+  sensor_cam   — Intel RealSense RGB-D  (also accepts legacy key 'realsense')
+  overhead_cam — eMeet C960 USB webcam
+
+Timestamp layout (per-sensor keys take priority over shared 'timestamp'):
+  {"iter":..., "spad":..., "spad_timestamp":"...",
+               "sensor_cam":...,   "sensor_cam_timestamp":"...",
+               "overhead_cam":..., "overhead_cam_timestamp":"..."}
 
 Usage:
     python sync_data.py [path/to/capture.pkl] [--max-dt-ms 100]
@@ -33,6 +32,20 @@ except ImportError:
     import pickle
 
 MAX_DT_MS = 100.0
+
+# Maps record data-keys to a canonical camera name.
+# Legacy 'realsense' is treated as 'sensor_cam'.
+_CAM_DATA_KEYS: dict[str, str] = {
+    "sensor_cam":   "sensor_cam",
+    "realsense":    "sensor_cam",   # backwards-compat alias
+    "overhead_cam": "overhead_cam",
+}
+# Corresponding per-sensor timestamp keys
+_CAM_TS_KEYS: dict[str, str] = {
+    "sensor_cam":   "sensor_cam_timestamp",
+    "realsense":    "realsense_timestamp",
+    "overhead_cam": "overhead_cam_timestamp",
+}
 
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
@@ -55,21 +68,23 @@ def _ts_to_s(ts) -> float:
     return datetime.fromisoformat(str(ts)).timestamp()
 
 
-# ── Frame extraction ───────────────────────────────────────────────────────────
+# ── Frame extraction ──────────────────────────────────────────────────────────
 
-def _extract_frames(records: list) -> tuple[list[float], list[float]]:
+def _extract_frames(
+    records: list,
+) -> tuple[list[float], dict[str, list[float]]]:
     """
-    Return (spad_timestamps, cam_timestamps) in record order.
+    Return (spad_timestamps, cam_timestamps) where cam_timestamps maps each
+    active camera's canonical name to its list of timestamps.
 
-    Per-sensor timestamp keys ('spad_timestamp' / 'realsense_timestamp') take
-    priority. Falls back to the shared 'timestamp' key when they are absent.
+    Only cameras that appear in at least one record are included in the dict.
     """
     spad_ts: list[float] = []
-    cam_ts: list[float] = []
+    cam_ts: dict[str, list[float]] = {}
 
     for r in records:
         if not isinstance(r, dict) or "iter" not in r:
-            continue  # skip metadata or malformed entries
+            continue
 
         shared = _ts_to_s(r["timestamp"]) if "timestamp" in r else None
 
@@ -78,15 +93,18 @@ def _extract_frames(records: list) -> tuple[list[float], list[float]]:
             if t is not None:
                 spad_ts.append(t)
 
-        if "realsense" in r:
-            t = _ts_to_s(r["realsense_timestamp"]) if "realsense_timestamp" in r else shared
+        for data_key, canonical in _CAM_DATA_KEYS.items():
+            if data_key not in r:
+                continue
+            ts_key = _CAM_TS_KEYS[data_key]
+            t = _ts_to_s(r[ts_key]) if ts_key in r else shared
             if t is not None:
-                cam_ts.append(t)
+                cam_ts.setdefault(canonical, []).append(t)
 
     return spad_ts, cam_ts
 
 
-# ── Nearest-neighbour matching ─────────────────────────────────────────────────
+# ── Nearest-neighbour matching ────────────────────────────────────────────────
 
 def _nearest_pool_idx(sorted_pool: list[float], q: float) -> int:
     """Return the index in *sorted_pool* of the value nearest to *q*."""
@@ -100,95 +118,101 @@ def _nearest_pool_idx(sorted_pool: list[float], q: float) -> int:
 
 def match_frames(
     spad_ts: list[float],
-    cam_ts: list[float],
-) -> list[tuple[int, int, float]]:
+    cam_ts: dict[str, list[float]],
+) -> dict[str, list[tuple[int, int, float]]]:
     """
-    Match every SPAD frame to its nearest camera frame.
+    Match every SPAD frame to its nearest frame for each camera independently.
 
     Returns:
-        List of (spad_idx, cam_idx, dt_s) sorted by spad_idx, where dt_s is
-        the absolute time difference in seconds.
+        Dict mapping camera name -> list of (spad_idx, cam_idx, dt_s) tuples,
+        sorted by spad_idx.
     """
-    # Build a sorted view of camera timestamps for binary search.
-    sorted_cam_order = sorted(range(len(cam_ts)), key=lambda i: cam_ts[i])
-    sorted_cam_ts = [cam_ts[i] for i in sorted_cam_order]
+    all_matches: dict[str, list[tuple[int, int, float]]] = {}
 
-    matches = []
-    for si, st in enumerate(spad_ts):
-        pool_pos = _nearest_pool_idx(sorted_cam_ts, st)
-        ci = sorted_cam_order[pool_pos]
-        matches.append((si, ci, abs(st - cam_ts[ci])))
+    for cam_name, ts_list in cam_ts.items():
+        sorted_order = sorted(range(len(ts_list)), key=lambda i: ts_list[i])
+        sorted_ts = [ts_list[i] for i in sorted_order]
 
-    return matches
+        matches = []
+        for si, st in enumerate(spad_ts):
+            pool_pos = _nearest_pool_idx(sorted_ts, st)
+            ci = sorted_order[pool_pos]
+            matches.append((si, ci, abs(st - ts_list[ci])))
+
+        all_matches[cam_name] = matches
+
+    return all_matches
 
 
-# ── Report ─────────────────────────────────────────────────────────────────────
+# ── Report ────────────────────────────────────────────────────────────────────
 
-def report(
+def _camera_report(
+    cam_name: str,
     n_spad: int,
     n_cam: int,
     matches: list[tuple[int, int, float]],
-    spad_ts: list[float],
     max_dt_ms: float,
 ):
     used_cam = {ci for _, ci, _ in matches}
-    n_unmatched_cam = n_cam - len(used_cam)
+    n_unmatched = n_cam - len(used_cam)
 
-    sep = "-" * 52
-    print(sep)
-    print(f"  SPAD frames:            {n_spad:>6}")
-    print(f"  Camera frames:          {n_cam:>6}")
-    print(sep)
-    print(f"  Matched SPAD frames:    {len(matches):>6}  (each -> nearest cam)")
-    print(f"  Unique camera matched:  {len(used_cam):>6}")
-    print(f"  Unmatched camera:       {n_unmatched_cam:>6}")
+    print(f"\n  [{cam_name}]  {n_cam} frames")
+    print(f"    Matched SPAD frames   : {len(matches):>6}  (each -> nearest cam)")
+    print(f"    Unique camera matched : {len(used_cam):>6}")
+    print(f"    Unmatched camera      : {n_unmatched:>6}")
 
     if not matches:
-        print(sep)
         return
 
     dts_ms = [dt * 1000 for _, _, dt in matches]
     mean_dt = sum(dts_ms) / len(dts_ms)
-
-    print(f"\n  Per-pair time differences (ms):")
-    for si, ci, dt_ms in [(si, ci, dt * 1000) for si, ci, dt in matches]:
-        flag = "  ***" if dt_ms > max_dt_ms else ""
-        print(f"    SPAD[{si:4d}] <-> cam[{ci:4d}]  dt = {dt_ms:8.2f}{flag}")
-    print(f"\n  Average |dt|: {mean_dt:.2f} ms  (min {min(dts_ms):.2f}, max {max(dts_ms):.2f})")
-
-    # Average interval between consecutive matched pairs (SPAD-side timestamps).
-    matched_ts = [spad_ts[si] for si, _, _ in matches]
-    if len(matched_ts) > 1:
-        intervals_ms = [(matched_ts[i+1] - matched_ts[i]) * 1000
-                        for i in range(len(matched_ts) - 1)]
-        mean_interval = sum(intervals_ms) / len(intervals_ms)
-        print(f"  Avg interval between matched frames: {mean_interval:.2f} ms"
-              f"  ({1000/mean_interval:.1f} fps)")
-
     n_over = sum(1 for dt_ms in dts_ms if dt_ms > max_dt_ms)
+
+    print(f"    Avg |dt|: {mean_dt:.2f} ms  "
+          f"(min {min(dts_ms):.2f}, max {max(dts_ms):.2f} ms)")
     if n_over:
-        print(f"\n  WARNING: {n_over} pair(s) marked *** exceed {max_dt_ms:.0f} ms threshold.")
+        print(f"    WARNING: {n_over} pair(s) exceed {max_dt_ms:.0f} ms threshold.")
     else:
-        print(f"\n  All pairs within {max_dt_ms:.0f} ms threshold.")
+        print(f"    All pairs within {max_dt_ms:.0f} ms threshold.")
+
+
+def report(
+    n_spad: int,
+    cam_ts: dict[str, list[float]],
+    all_matches: dict[str, list[tuple[int, int, float]]],
+    spad_ts: list[float],
+    max_dt_ms: float,
+):
+    sep = "-" * 52
+    print(sep)
+    print(f"  SPAD frames : {n_spad}")
+    for cam_name, matches in all_matches.items():
+        _camera_report(cam_name, n_spad, len(cam_ts[cam_name]), matches, max_dt_ms)
+
+    # Overall SPAD cadence
+    if n_spad > 1:
+        intervals_ms = [(spad_ts[i+1] - spad_ts[i]) * 1000
+                        for i in range(len(spad_ts) - 1)]
+        mean_iv = sum(intervals_ms) / len(intervals_ms)
+        print(f"\n  SPAD avg interval : {mean_iv:.2f} ms  ({1000/mean_iv:.1f} fps)")
 
     print(sep)
 
 
-# ── Index export ───────────────────────────────────────────────────────────────
+# ── Index export ──────────────────────────────────────────────────────────────
 
 def save_index(
     pkl_path: Path,
-    matches: list[tuple[int, int, float]],
+    all_matches: dict[str, list[tuple[int, int, float]]],
     spad_ts: list[float],
-    cam_ts: list[float],
+    cam_ts: dict[str, list[float]],
     max_dt_ms: float,
 ) -> Path:
     """
     Write a JSON sync index alongside *pkl_path*.
 
-    The index contains only indices and timing metadata — no sensor data — so
-    the training pipeline can load matched pairs on demand from the raw pkl
-    without duplicating arrays.
+    Each entry in 'pairs' corresponds to one SPAD frame and includes the
+    nearest-matched index from every active camera.
 
     Returns the path of the written file.
     """
@@ -197,26 +221,42 @@ def save_index(
     def _iso(ts: float) -> str:
         return datetime.fromtimestamp(ts).isoformat()
 
-    dts_ms = [dt * 1000 for _, _, dt in matches]
-    pairs = [
-        {
-            "spad_idx": si,
-            "cam_idx": ci,
-            "dt_ms": round(dt_ms, 3),
-            "spad_ts": _iso(spad_ts[si]),
-            "cam_ts": _iso(cam_ts[ci]),
+    n_spad = len(spad_ts)
+
+    # Build per-camera lookup: spad_idx -> (cam_idx, dt_ms, cam_ts)
+    cam_lookup: dict[str, dict[int, dict]] = {}
+    for cam_name, matches in all_matches.items():
+        cam_lookup[cam_name] = {
+            si: {"idx": ci, "dt_ms": round(dt * 1000, 3),
+                 "ts": _iso(cam_ts[cam_name][ci])}
+            for si, ci, dt in matches
         }
-        for (si, ci, _), dt_ms in zip(matches, dts_ms)
-    ]
+
+    pairs = []
+    for si in range(n_spad):
+        entry: dict = {"spad_idx": si, "spad_ts": _iso(spad_ts[si])}
+        for cam_name, lookup in cam_lookup.items():
+            if si in lookup:
+                entry[cam_name] = lookup[si]
+        pairs.append(entry)
+
+    # Summary stats per camera
+    camera_stats = {}
+    for cam_name, matches in all_matches.items():
+        dts_ms = [dt * 1000 for _, _, dt in matches]
+        camera_stats[cam_name] = {
+            "n_frames": len(cam_ts[cam_name]),
+            "n_matched": len(matches),
+            "n_over_threshold": sum(1 for dt_ms in dts_ms if dt_ms > max_dt_ms),
+            "mean_dt_ms": round(sum(dts_ms) / len(dts_ms), 3) if dts_ms else None,
+        }
 
     index = {
         "source_pkl": str(pkl_path.resolve()),
         "created": datetime.now().isoformat(),
         "max_dt_ms": max_dt_ms,
-        "n_spad": len(spad_ts),
-        "n_cam": len(cam_ts),
-        "n_pairs": len(pairs),
-        "n_pairs_over_threshold": sum(1 for dt_ms in dts_ms if dt_ms > max_dt_ms),
+        "n_spad": n_spad,
+        "cameras": camera_stats,
         "pairs": pairs,
     }
 
@@ -226,16 +266,19 @@ def save_index(
     return index_path
 
 
-# ── Public API ─────────────────────────────────────────────────────────────────
+# ── Public API ────────────────────────────────────────────────────────────────
 
-def sync(pkl_path: Path, max_dt_ms: float = MAX_DT_MS, save: bool = True) -> list[tuple[int, int, float]]:
+def sync(
+    pkl_path: Path,
+    max_dt_ms: float = MAX_DT_MS,
+    save: bool = True,
+) -> dict[str, list[tuple[int, int, float]]]:
     """
-    Load *pkl_path*, match SPAD and camera frames by timestamp, print a
-    summary report, and (if *save* is True) write a JSON index alongside the
-    pkl.
+    Load *pkl_path*, match SPAD frames to each camera by timestamp, print a
+    summary report, and (if *save* is True) write a JSON index alongside the pkl.
 
     Returns:
-        List of (spad_idx, cam_idx, dt_s) matched pairs.
+        Dict mapping camera name -> list of (spad_idx, cam_idx, dt_s) pairs.
     """
     print(f"\nFile: {pkl_path}")
     records = load_records(pkl_path)
@@ -245,29 +288,25 @@ def sync(pkl_path: Path, max_dt_ms: float = MAX_DT_MS, save: bool = True) -> lis
     print(f"Loaded {len(records)} records  ({n_data} data, {n_meta} metadata)\n")
 
     spad_ts, cam_ts = _extract_frames(records)
-    n_spad, n_cam = len(spad_ts), len(cam_ts)
 
-    if n_spad == 0 and n_cam == 0:
-        print("No sensor frames found.")
-        return []
-    if n_spad == 0:
-        print(f"No SPAD frames found; {n_cam} camera frames available.")
-        return []
-    if n_cam == 0:
-        print(f"No camera frames found; {n_spad} SPAD frames available.")
-        return []
+    if not spad_ts:
+        print("No SPAD frames found.")
+        return {}
+    if not cam_ts:
+        print(f"No camera frames found; {len(spad_ts)} SPAD frames available.")
+        return {}
 
-    matches = match_frames(spad_ts, cam_ts)
-    report(n_spad, n_cam, matches, spad_ts, max_dt_ms)
+    all_matches = match_frames(spad_ts, cam_ts)
+    report(len(spad_ts), cam_ts, all_matches, spad_ts, max_dt_ms)
 
     if save:
-        index_path = save_index(pkl_path, matches, spad_ts, cam_ts, max_dt_ms)
+        index_path = save_index(pkl_path, all_matches, spad_ts, cam_ts, max_dt_ms)
         print(f"Index saved: {index_path}")
 
-    return matches
+    return all_matches
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
