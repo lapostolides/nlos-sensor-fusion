@@ -13,12 +13,13 @@ import argparse
 import json
 import pickle
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, List, Optional
 
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 # COCO class ID for person
@@ -40,14 +41,20 @@ class PersonLocation:
     center: tuple[float, float]              # (cx, cy) pixels
     confidence: float                        # detection confidence [0, 1]
     track_id: Optional[int]                  # persistent ID (None if untracked)
+    pose: Optional[str] = field(default=None)       # Pose enum value string, or None
+    pose_conf: float    = field(default=0.0)        # pose classifier confidence [0, 1]
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "bbox":       list(self.bbox),
             "center":     list(self.center),
             "confidence": round(self.confidence, 4),
             "track_id":   self.track_id,
         }
+        if self.pose is not None:
+            d["pose"]      = self.pose
+            d["pose_conf"] = round(self.pose_conf, 4)
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> "PersonLocation":
@@ -56,6 +63,8 @@ class PersonLocation:
             center=tuple(d["center"]),      # type: ignore[arg-type]
             confidence=d["confidence"],
             track_id=d["track_id"],
+            pose=d.get("pose"),
+            pose_conf=d.get("pose_conf", 0.0),
         )
 
 
@@ -73,9 +82,15 @@ class LogDetection:
 class GroundTruthDetector:
     """Detects one or more people in RGB camera frames using YOLO."""
 
-    def __init__(self, model: str = "yolov8n.pt", confidence_threshold: float = 0.3):
+    def __init__(
+        self,
+        model: str = "yolov8n.pt",
+        confidence_threshold: float = 0.3,
+        device: Optional[str] = None,
+    ):
         self.model = YOLO(model)
         self.confidence_threshold = confidence_threshold
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     def process(
         self,
@@ -89,7 +104,7 @@ class GroundTruthDetector:
             frame: BGR image (H, W, 3).
             normalized: If True coordinates are in [0, 1]; otherwise pixels.
         """
-        results = self.model.track(frame, verbose=False, persist=True)[0]
+        results = self.model.track(frame, verbose=False, persist=True, device=self.device)[0]
         height, width = frame.shape[:2]
         locations: List[PersonLocation] = []
 
@@ -124,6 +139,7 @@ class GroundTruthDetector:
 def iter_log(
     pkl_path: Path | str,
     detector: GroundTruthDetector,
+    classifier=None,               # Optional[PoseClassifier] from pose_estimation
     camera_key: str = GT_CAMERA_KEY,
     normalized: bool = False,
 ) -> Iterator[LogDetection]:
@@ -131,6 +147,11 @@ def iter_log(
     Iterate over records in a PKL log file and yield person detections.
 
     Skips records without a camera frame for *camera_key*.
+
+    If *classifier* is provided (a PoseClassifier), pose is classified for
+    each detected person and stored in ``PersonLocation.pose`` /
+    ``PersonLocation.pose_conf``.  Classification always runs in pixel space;
+    normalization (if requested) is applied afterwards.
     """
     with open(Path(pkl_path), "rb") as f:
         while True:
@@ -144,11 +165,25 @@ def iter_log(
             if cam_data is None:
                 continue
             frame = cam_data["raw_rgb"]
-            yield LogDetection(
-                iter=record["iter"],
-                locations=detector.process(frame, normalized=normalized),
-                frame=frame,
-            )
+
+            # Always detect in pixel space so the classifier can match keypoints
+            locs = detector.process(frame, normalized=False)
+
+            if classifier is not None and locs:
+                poses = classifier.classify_frame(frame, locs)
+                for loc, p in zip(locs, poses):
+                    loc.pose      = p.pose.value
+                    loc.pose_conf = p.confidence
+
+            if normalized:
+                h, w = frame.shape[:2]
+                for loc in locs:
+                    bx, by, bw, bh = loc.bbox
+                    cx, cy = loc.center
+                    loc.bbox   = (bx / w, by / h, bw / w, bh / h)
+                    loc.center = (cx / w, cy / h)
+
+            yield LogDetection(iter=record["iter"], locations=locs, frame=frame)
 
 
 # ── Sidecar JSON I/O ──────────────────────────────────────────────────────────
@@ -207,19 +242,33 @@ def load_gt(pkl_path: Path) -> dict[int, List[PersonLocation]] | None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def _run(pkl_path: Path, model: str, confidence: float) -> None:
-    print(f"File  : {pkl_path}")
+def _run(
+    pkl_path:    Path,
+    model:       str,
+    confidence:  float,
+    pose_model:  Optional[str] = None,
+    device:      Optional[str] = None,
+) -> None:
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"File   : {pkl_path}")
+    print(f"Device : {device}")
 
     existing = gt_path(pkl_path)
     if existing.exists():
         print(f"Overwriting existing GT file: {existing}")
 
-    detector = GroundTruthDetector(model=model, confidence_threshold=confidence)
+    detector   = GroundTruthDetector(model=model, confidence_threshold=confidence,
+                                     device=device)
+    classifier = None
+    if pose_model is not None:
+        from pose_estimation import PoseClassifier  # type: ignore[import]
+        classifier = PoseClassifier(model=pose_model, device=device)
+        print(f"Pose   : {pose_model}")
 
     detections: dict[int, List[PersonLocation]] = {}
     n_frames = n_persons = 0
 
-    for det in iter_log(pkl_path, detector, normalized=False):
+    for det in iter_log(pkl_path, detector, classifier=classifier, normalized=False):
         detections[det.iter] = det.locations
         n_frames += 1
         n_persons += len(det.locations)
@@ -232,6 +281,13 @@ def _run(pkl_path: Path, model: str, confidence: float) -> None:
     print(f"Frames with overhead_cam : {n_frames}")
     print(f"Total detections         : {n_persons}")
     print(f"Frames with a person     : {sum(1 for v in detections.values() if v)}")
+    if pose_model is not None:
+        pose_counts: dict[str, int] = {}
+        for locs in detections.values():
+            for loc in locs:
+                if loc.pose:
+                    pose_counts[loc.pose] = pose_counts.get(loc.pose, 0) + 1
+        print(f"Pose breakdown           : {pose_counts}")
 
 
 def main() -> None:
@@ -243,6 +299,20 @@ def main() -> None:
                         help="YOLO model (default: yolov8n.pt).")
     parser.add_argument("--conf", type=float, default=0.3,
                         help="Detection confidence threshold (default: 0.3).")
+    parser.add_argument("--pose", dest="pose_model", nargs="?",
+                        const="yolo11n-pose.pt", default=None,
+                        metavar="MODEL",
+                        help=(
+                            "Enable pose classification.  Optionally provide a "
+                            "model name (default: yolo11n-pose.pt).  "
+                            "Example: --pose  or  --pose yolov8n-pose.pt"
+                        ))
+    parser.add_argument("--device", default=None,
+                        help=(
+                            "Compute device for YOLO inference "
+                            "(default: cuda if available, else cpu).  "
+                            "Examples: cuda, cpu, cuda:0"
+                        ))
     args = parser.parse_args()
 
     if args.pkl:
@@ -258,7 +328,8 @@ def main() -> None:
         path = logs[-1]
         print(f"Auto-detected: {path}")
 
-    _run(path, model=args.model, confidence=args.conf)
+    _run(path, model=args.model, confidence=args.conf,
+         pose_model=args.pose_model, device=args.device)
 
 
 if __name__ == "__main__":

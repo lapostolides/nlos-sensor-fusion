@@ -143,7 +143,7 @@ def _draw_detections(
         cv2.line(out, (pcx - r, pcy), (pcx + r, pcy), (0, 255, 0), 2)
         cv2.line(out, (pcx, pcy - r), (pcx, pcy + r), (0, 255, 0), 2)
 
-        # Label
+        # Label — track ID + detection confidence
         tid = f"ID:{loc.track_id}" if loc.track_id is not None else "ID:?"
         label = f"{tid}  {loc.confidence:.0%}"
         lx, ly = x1, max(y1 - 6, 14)
@@ -151,6 +151,17 @@ def _draw_detections(
                     0.55, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # Pose label (shown inside the box when pose estimation was run)
+        pose = getattr(loc, "pose", None)
+        if pose is not None:
+            pose_conf = getattr(loc, "pose_conf", 0.0)
+            pose_label = f"{pose}  {pose_conf:.0%}"
+            ply = min(y1 + 18, y2 - 4)
+            cv2.putText(out, pose_label, (x1 + 4, ply), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.50, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(out, pose_label, (x1 + 4, ply), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.50, (0, 220, 255), 1, cv2.LINE_AA)
 
     return out
 
