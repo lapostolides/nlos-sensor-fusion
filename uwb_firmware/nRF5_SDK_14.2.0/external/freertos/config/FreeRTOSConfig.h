@@ -100,7 +100,7 @@
 #define configTICK_RATE_HZ                                                        1024
 #define configMAX_PRIORITIES                                                      ( 3 )
 #define configMINIMAL_STACK_SIZE                                                  ( 60 )
-#define configTOTAL_HEAP_SIZE                                                     ( 4096 )
+#define configTOTAL_HEAP_SIZE                                                     ( 24 * 1024 )
 #define configMAX_TASK_NAME_LEN                                                   ( 4 )
 #define configUSE_16_BIT_TICKS                                                    0
 #define configIDLE_SHOULD_YIELD                                                   1
@@ -133,7 +133,7 @@
 #define configUSE_TIMERS                                                          1
 #define configTIMER_TASK_PRIORITY                                                 ( 2 )
 #define configTIMER_QUEUE_LENGTH                                                  32
-#define configTIMER_TASK_STACK_DEPTH                                              ( 80 )
+#define configTIMER_TASK_STACK_DEPTH                                              ( 256 )
 
 /* Tickless Idle configuration. */
 #define configEXPECTED_IDLE_TIME_BEFORE_SLEEP                                     2

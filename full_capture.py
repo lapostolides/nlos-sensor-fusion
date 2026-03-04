@@ -232,12 +232,16 @@ def run_loop(
     stop = threading.Event()
     threads = _start_workers(manager, spad_buf, sensor_cam_buf, overhead_cam_buf, stop)
 
-    if cfg.USE_SPAD:
-        pace_buf, pace_name = spad_buf, "SPAD"
-    elif cfg.USE_SENSOR_CAM:
+    # Pace on a camera rather than SPAD so that recording continues even if the
+    # SPAD serial process hangs (accumulate() blocks forever on an empty queue).
+    # SPAD data is still included each record; it just goes stale if the sensor
+    # drops out rather than stopping recording entirely.
+    if cfg.USE_SENSOR_CAM:
         pace_buf, pace_name = sensor_cam_buf, "sensor_cam"
-    else:
+    elif cfg.USE_OVERHEAD_CAM:
         pace_buf, pace_name = overhead_cam_buf, "overhead_cam"
+    else:
+        pace_buf, pace_name = spad_buf, "SPAD"
 
     print("\033[1;36mContinuous capture started (threaded). Press Ctrl+C to stop.\033[0m\n")
     idx = 0

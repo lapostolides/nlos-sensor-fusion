@@ -35,8 +35,6 @@
 
 #include "port_platform.h"
 #include "deca_types.h"
-#include "nrf_uart.h"
-#include "UART.h"
 #include "deca_param_types.h"
 #include "deca_regs.h"
 #include "deca_device_api.h"
@@ -120,33 +118,26 @@ int main(void)
     UNUSED_VARIABLE(xTimerStart(led_toggle_timer_handle, 0));
 
     /* Create task for SS TWR Initiator set to 2 */
-    UNUSED_VARIABLE(xTaskCreate(ss_responder_task_function, "SSTWR_RESP", 2500, NULL, 2, &ss_responder_task_handle)); 
+    UNUSED_VARIABLE(xTaskCreate(ss_responder_task_function, "SSTWR_RESP", configMINIMAL_STACK_SIZE + 200, NULL, 2, &ss_responder_task_handle)); 
   #endif  // #ifdef USE_FREERTOS
 
   //-------------dw1000  ini------------------------------------	
 
-  /* Raw polled UART — bypasses the broken app_uart driver */
-  NRF_UART0->ENABLE     = 0;
-  NRF_UART0->PSELTXD    = 5;
-  NRF_UART0->PSELRXD    = 0xFFFFFFFF;
-  NRF_UART0->BAUDRATE   = 0x01D7E000;  /* 115200 */
-  NRF_UART0->CONFIG     = 0;
-  NRF_UART0->ENABLE     = 4;
-  NRF_UART0->TASKS_STARTTX = 1;
-
   /* Setup DW1000 IRQ pin */
-  nrf_gpio_cfg_input(DW1000_IRQ, NRF_GPIO_PIN_NOPULL);
+  nrf_gpio_cfg_input(DW1000_IRQ, NRF_GPIO_PIN_NOPULL); 		//irq
 
   /* Reset DW1000 */
-  reset_DW1000();
+  reset_DW1000(); 
 
   /* Set SPI clock to 2MHz */
-  port_set_dw1000_slowrate();
+  port_set_dw1000_slowrate();			
 
   /* Init the DW1000 */
   if (dwt_initialise(DWT_LOADUCODE) == DWT_ERROR)
   {
-    while (1) {};
+    //Init of DW1000 Failed
+    while (1)
+    {};
   }
 
   // Set SPI to 8MHz clock
@@ -162,12 +153,13 @@ int main(void)
   /* Set preamble timeout for expected frames.  */
   //dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
-  dwt_setrxtimeout(0);
-  dwt_setpreambledetecttimeout(1000);
+  dwt_setrxtimeout(0);    // set to NO receive timeout for this simple example   
 
   //-------------dw1000  ini------end---------------------------	
 
+  // IF WE GET HERE THEN THE LEDS WILL BLINK
   #ifdef USE_FREERTOS
+    /* Start FreeRTOS scheduler. */
     vTaskStartScheduler();	
 
     while(1)

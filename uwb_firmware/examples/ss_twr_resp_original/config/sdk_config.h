@@ -3088,7 +3088,7 @@
  
 
 #ifndef UART0_CONFIG_USE_EASY_DMA
-#define UART0_CONFIG_USE_EASY_DMA 0
+#define UART0_CONFIG_USE_EASY_DMA 1
 #endif
 
 // </e>

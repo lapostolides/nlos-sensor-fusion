@@ -391,6 +391,11 @@ class USBCameraWrapper(RGBDCamera):
                 "Check that the camera is connected."
             )
 
+        # Force MJPEG — required for resolutions above 720p on most USB cameras
+        # (e.g. eMeet C960 at 1080p only supports MJPEG, not raw YUY2).
+        # Must be set before width/height so MSMF negotiates the right format.
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
         if self._req_width is not None:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._req_width)
         if self._req_height is not None:
