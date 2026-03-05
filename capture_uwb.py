@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 """
-capture_uwb.py - Capture UWB CIR frames to disk.
+capture_uwb.py - Capture UWB CIR + timestamps from responder and initiator.
 
-Reads CIR binary frames from a DWM1001-Dev over UART and saves them as a
-single .npz file.  Press Ctrl+C to stop and flush to disk.
+Reads binary frames from two DWM1001-Dev boards over UART:
+  - Responder (rx): CIR accumulator + RX timestamp  (4078-byte frames)
+  - Initiator (tx): TX timestamp only                (10-byte frames)
 
-Output arrays in the .npz:
+Press Ctrl+C to stop and flush to disk.
+
+Responder .npz arrays:
   cir        (N, 1016) complex64  — normalised complex CIR samples
   seq        (N,)      uint16     — firmware frame counter
-  fp_index   (N,)      uint16     — first-path index (after 10.6 conversion)
+  fp_index   (N,)      uint16     — first-path index (10.6 → integer)
   rxpacc     (N,)      uint16     — preamble accumulation count
+  rx_ts      (N,)      uint64     — DW1000 40-bit RX timestamp (~15.65 ps/tick)
+  timestamp  (N,)      float64    — host-side time.monotonic() at parse
+
+Initiator .npz arrays:
+  seq        (N,)      uint16     — firmware frame counter
+  tx_ts      (N,)      uint64     — DW1000 40-bit TX timestamp (~15.65 ps/tick)
   timestamp  (N,)      float64    — host-side time.monotonic() at parse
 
 Usage:
-  python capture_uwb.py
-  python capture_uwb.py --port COM5
-  python capture_uwb.py --port COM5 --baud 115200
+  python capture_uwb.py                                        # auto-detect
+  python capture_uwb.py --resp-port COM5                       # responder only
+  python capture_uwb.py --resp-port COM5 --init-port COM6
+  python capture_uwb.py --name my-experiment
 """
 
 import argparse
 import struct
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,32 +39,37 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 
-# ── Frame format constants ───────────────────────────────────────────────────
-SYNC        = bytes([0xBC, 0xAD])
-HEADER_FMT  = "<HHH"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)
-N_SAMPLES   = 1016
-CIR_SIZE    = N_SAMPLES * 4
-FRAME_SIZE  = 2 + HEADER_SIZE + CIR_SIZE + 1  # 4073
+# ── Responder frame format (4078 bytes) ──────────────────────────────────────
+#   sync(2) + seq(2) + fp_index(2) + rxpacc(2) + rx_ts(5) + cir(4064) + xor(1)
+SYNC          = bytes([0xBC, 0xAD])
+RESP_HDR_FMT  = "<HHH"
+RESP_HDR_SIZE = struct.calcsize(RESP_HDR_FMT)        # 6
+RX_TS_SIZE    = 5
+N_SAMPLES     = 1016
+CIR_SIZE      = N_SAMPLES * 4                         # 4064
+RESP_FRAME    = 2 + RESP_HDR_SIZE + RX_TS_SIZE + CIR_SIZE + 1  # 4078
+
+# ── Initiator frame format (10 bytes) ────────────────────────────────────────
+#   sync(2) + seq(2) + tx_ts(5) + xor(1)
+INIT_HDR_FMT  = "<H"
+INIT_HDR_SIZE = struct.calcsize(INIT_HDR_FMT)         # 2
+TX_TS_SIZE    = 5
+INIT_FRAME    = 2 + INIT_HDR_SIZE + TX_TS_SIZE + 1    # 10
 
 LOGDIR = Path("data/uwb/logs")
 
 
-# ── Serial helpers ───────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def find_port() -> str:
-    ports = list(serial.tools.list_ports.comports())
-    for p in ports:
+def find_jlink_ports() -> list:
+    """Return JLink/DWM serial port info objects, sorted by device name."""
+    result = []
+    for p in serial.tools.list_ports.comports():
         desc = (p.description or "").upper()
         if any(k in desc for k in ("JLINK", "J-LINK", "DWM")):
-            print(f"[uwb] Auto-detected: {p.device} ({p.description})")
-            return p.device
-    if ports:
-        print("[uwb] Available ports:")
-        for i, p in enumerate(ports):
-            print(f"  [{i}] {p.device} — {p.description}")
-        return ports[int(input("Select index: "))].device
-    raise RuntimeError("No serial ports found.")
+            result.append(p)
+    result.sort(key=lambda p: p.device)
+    return result
 
 
 def xor_checksum(data: bytes) -> int:
@@ -63,144 +79,182 @@ def xor_checksum(data: bytes) -> int:
     return result
 
 
-def parse_frame(raw: bytes):
-    """Return (seq, fp_index, rxpacc, cir_complex) or None on checksum error."""
+def ts40_to_uint64(raw: bytes) -> np.uint64:
+    """Convert a 5-byte little-endian DW1000 timestamp to uint64."""
+    return np.uint64(int.from_bytes(raw, "little"))
+
+
+def parse_resp_frame(raw: bytes):
+    """Parse responder frame (4078B with rx_ts) → (seq, fp_index, rxpacc, rx_ts, cir) or None."""
+    if len(raw) != RESP_FRAME:
+        return None
     payload = raw[2:-1]
     if xor_checksum(payload) != raw[-1]:
         return None
 
-    header_bytes = payload[:HEADER_SIZE]
-    cir_bytes    = payload[HEADER_SIZE:]
+    hdr_end = RESP_HDR_SIZE
+    ts_end  = hdr_end + RX_TS_SIZE
 
-    seq, fp_index_raw, rxpacc = struct.unpack(HEADER_FMT, header_bytes)
-    fp_index = min(fp_index_raw >> 6, N_SAMPLES - 1)
+    seq, fp_raw, rxpacc = struct.unpack(RESP_HDR_FMT, payload[:hdr_end])
+    rx_ts    = ts40_to_uint64(payload[hdr_end:ts_end])
+    fp_index = min(fp_raw >> 6, N_SAMPLES - 1)
 
-    iq = np.frombuffer(cir_bytes, dtype="<i2").reshape(N_SAMPLES, 2).astype(np.float32)
+    iq  = np.frombuffer(payload[ts_end:], dtype="<i2").reshape(N_SAMPLES, 2).astype(np.float32)
     cir = iq[:, 0] + 1j * iq[:, 1]
     if rxpacc > 0:
         cir /= rxpacc
 
-    return seq, fp_index, rxpacc, cir
+    return seq, fp_index, rxpacc, rx_ts, cir
 
 
-# ── Capture loop ─────────────────────────────────────────────────────────────
+def parse_resp_frame_legacy(raw: bytes):
+    """Parse responder frame (4073B, no rx_ts) → (seq, fp_index, rxpacc, rx_ts, cir) or None."""
+    if len(raw) != RESP_FRAME_LEGACY:
+        return None
+    payload = raw[2:-1]
+    if xor_checksum(payload) != raw[-1]:
+        return None
 
-def capture(port: str, baud: int):
-    LOGDIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now()
-    outpath = LOGDIR / f"cir_{now.strftime('%Y-%m-%d_%H-%M-%S')}.npz"
+    hdr_end = RESP_HDR_SIZE
 
-    seqs      = []
-    fp_idxs   = []
-    rxpaccs   = []
-    cirs      = []
-    timestamps = []
+    seq, fp_raw, rxpacc = struct.unpack(RESP_HDR_FMT, payload[:hdr_end])
+    fp_index = min(fp_raw >> 6, N_SAMPLES - 1)
+    rx_ts    = np.uint64(0)  # not present in legacy format
 
+    iq  = np.frombuffer(payload[hdr_end:], dtype="<i2").reshape(N_SAMPLES, 2).astype(np.float32)
+    cir = iq[:, 0] + 1j * iq[:, 1]
+    if rxpacc > 0:
+        cir /= rxpacc
+
+    return seq, fp_index, rxpacc, rx_ts, cir
+
+
+def try_parse_resp(buf: bytearray) -> tuple:
+    """Try parsing responder frame. Returns (result, bytes_consumed) or (None, 0)."""
+    if len(buf) >= RESP_FRAME:
+        raw = bytes(buf[:RESP_FRAME])
+        result = parse_resp_frame(raw)
+        if result is not None:
+            return result, RESP_FRAME
+    if len(buf) >= RESP_FRAME_LEGACY:
+        raw = bytes(buf[:RESP_FRAME_LEGACY])
+        result = parse_resp_frame_legacy(raw)
+        if result is not None:
+            return result, RESP_FRAME_LEGACY
+    return None, 0
+
+
+def parse_init_frame(raw: bytes):
+    """Parse initiator frame → (seq, tx_ts) or None."""
+    payload = raw[2:-1]
+    if xor_checksum(payload) != raw[-1]:
+        return None
+
+    hdr_end = INIT_HDR_SIZE
+    ts_end  = hdr_end + TX_TS_SIZE
+
+    (seq,)  = struct.unpack(INIT_HDR_FMT, payload[:hdr_end])
+    tx_ts   = ts40_to_uint64(payload[hdr_end:ts_end])
+
+    return seq, tx_ts
+
+
+# ── Generic binary-frame capture loop ────────────────────────────────────────
+
+def _stream_loop(tag, ser, frame_size, parse_fn, on_frame, stop):
+    """Read from *ser*, find SYNC-delimited frames, call on_frame(result, t)."""
     buf = bytearray()
     stats = {
         "frames": 0, "errors": 0, "bytes": 0,
         "syncs": 0, "t0": time.monotonic(), "last_diag": time.monotonic(),
     }
 
+    while not stop.is_set():
+        chunk = ser.read(512)
+        if not chunk:
+            now_t = time.monotonic()
+            if now_t - stats["last_diag"] >= 5.0:
+                elapsed = now_t - stats["t0"]
+                print(f"[{tag}] {elapsed:.0f}s | {stats['bytes']}B rx | "
+                      f"{stats['syncs']} syncs | {stats['frames']} frames | "
+                      f"{stats['errors']} chk errors")
+                if stats["bytes"] == 0:
+                    print(f"[{tag}]   ** No bytes received — check board power **")
+                stats["last_diag"] = now_t
+            continue
+
+        stats["bytes"] += len(chunk)
+        buf.extend(chunk)
+
+        while len(buf) >= frame_size:
+            idx = buf.find(SYNC)
+            if idx == -1:
+                buf = buf[-1:]
+                break
+            if idx > 0:
+                buf = buf[idx:]
+            if len(buf) < frame_size:
+                break
+
+            stats["syncs"] += 1
+            raw = bytes(buf[:frame_size])
+            result = parse_fn(raw)
+
+            if result is not None:
+                stats["frames"] += 1
+                on_frame(result, time.monotonic())
+                if stats["frames"] == 1:
+                    print(f"[{tag}] First valid frame after "
+                          f"{time.monotonic() - stats['t0']:.1f}s")
+                buf = buf[frame_size:]
+            else:
+                stats["errors"] += 1
+                if stats["errors"] <= 5:
+                    print(f"[{tag}] Checksum mismatch #{stats['errors']}")
+                buf = buf[1:]
+
+            if stats["frames"] > 0 and stats["frames"] % 100 == 0:
+                elapsed = time.monotonic() - stats["t0"]
+                fps = stats["frames"] / elapsed
+                err_rate = stats["errors"] / max(stats["frames"] + stats["errors"], 1)
+                print(f"[{tag}] {stats['frames']} frames | {fps:.1f} fps | "
+                      f"error rate {err_rate:.1%}")
+
+    return stats
+
+
+# ── Responder capture thread ─────────────────────────────────────────────────
+
+def capture_responder(port, baud, outpath, stop):
+    tag = "resp"
     try:
-        ser = serial.Serial(port, baud, timeout=0.05)
-        print(f"[uwb] Opened {port} at {baud} baud")
+        ser = serial.Serial(port, baud, timeout=0.1)
+        print(f"[{tag}] Opened {port} at {baud} baud")
     except Exception as e:
-        print(f"[uwb] Failed to open port: {e}")
+        print(f"[{tag}] Failed to open {port}: {e}")
         return
 
-    print(f"[uwb] Recording to {outpath}")
-    print("[uwb] Press Ctrl+C to stop.\n")
+    print(f"[{tag}] Recording to {outpath}")
 
-    try:
-        with ser:
-            while True:
-                chunk = ser.read(512)
-                if not chunk:
-                    now_t = time.monotonic()
-                    if now_t - stats["last_diag"] >= 3.0:
-                        elapsed = now_t - stats["t0"]
-                        print(f"[uwb] {elapsed:.0f}s | {stats['bytes']} bytes rx | "
-                              f"{stats['syncs']} syncs | {stats['frames']} frames | "
-                              f"{stats['errors']} checksum errors")
-                        if stats["bytes"] == 0:
-                            print("[uwb]   ** No bytes received — check that both boards are "
-                                  "powered and this port is the RESPONDER board **")
-                        elif stats["syncs"] == 0:
-                            print("[uwb]   ** Bytes received but no sync (0xBC 0xAD) found — "
-                                  "possible baud rate mismatch **")
-                        elif stats["frames"] == 0:
-                            print("[uwb]   ** Syncs found but all checksums fail — "
-                                  "possible frame format mismatch **")
-                        stats["last_diag"] = now_t
-                    continue
-                stats["bytes"] += len(chunk)
+    seqs, fp_idxs, rxpaccs, rx_tss, cirs, timestamps = [], [], [], [], [], []
 
-                if b"CIR:" in chunk:
-                    try:
-                        text = chunk.decode("ascii", errors="replace").strip()
-                        for line in text.splitlines():
-                            if "CIR:" in line:
-                                print(f"[uwb] FIRMWARE: {line.strip()}")
-                    except Exception:
-                        pass
+    def on_frame(result, t):
+        seq, fp_index, rxpacc, rx_ts, cir = result
+        seqs.append(seq)
+        fp_idxs.append(fp_index)
+        rxpaccs.append(rxpacc)
+        rx_tss.append(rx_ts)
+        cirs.append(cir)
+        timestamps.append(t)
 
-                buf.extend(chunk)
-
-                while len(buf) >= FRAME_SIZE:
-                    idx = buf.find(SYNC)
-                    if idx == -1:
-                        buf = buf[-1:]
-                        break
-                    if idx > 0:
-                        buf = buf[idx:]
-                    if len(buf) < FRAME_SIZE:
-                        break
-
-                    stats["syncs"] += 1
-                    raw = bytes(buf[:FRAME_SIZE])
-                    result = parse_frame(raw)
-
-                    if result is not None:
-                        t_recv = time.monotonic()
-                        seq, fp_index, rxpacc, cir = result
-                        stats["frames"] += 1
-
-                        seqs.append(seq)
-                        fp_idxs.append(fp_index)
-                        rxpaccs.append(rxpacc)
-                        cirs.append(cir)
-                        timestamps.append(t_recv)
-
-                        if stats["frames"] == 1:
-                            print(f"[uwb] First valid frame after "
-                                  f"{t_recv - stats['t0']:.1f}s")
-                        buf = buf[FRAME_SIZE:]
-                    else:
-                        stats["errors"] += 1
-                        if stats["errors"] <= 5:
-                            print(f"[uwb] Checksum mismatch #{stats['errors']} "
-                                  f"(total syncs: {stats['syncs']})")
-                        buf = buf[1:]
-
-                    if stats["frames"] % 100 == 0 and stats["frames"] > 0:
-                        elapsed = time.monotonic() - stats["t0"]
-                        fps = stats["frames"] / elapsed
-                        err_rate = stats["errors"] / max(stats["frames"] + stats["errors"], 1)
-                        print(f"[uwb] {stats['frames']} frames | {fps:.1f} fps | "
-                              f"error rate {err_rate:.1%}")
-
-    except KeyboardInterrupt:
-        pass
+    with ser:
+        stats = _stream_loop(tag, ser, RESP_FRAME, parse_resp_frame,
+                             on_frame, stop)
 
     n = stats["frames"]
     if n == 0:
-        print("\n[uwb] No frames captured, nothing to save.")
+        print(f"[{tag}] No frames captured.")
         return
-
-    elapsed = time.monotonic() - stats["t0"]
-    fps = n / elapsed
-    err_rate = stats["errors"] / max(n + stats["errors"], 1)
 
     ts_arr = np.array(timestamps, dtype=np.float64)
     ts_arr -= ts_arr[0]
@@ -211,23 +265,162 @@ def capture(port: str, baud: int):
         seq=np.array(seqs, dtype=np.uint16),
         fp_index=np.array(fp_idxs, dtype=np.uint16),
         rxpacc=np.array(rxpaccs, dtype=np.uint16),
+        rx_ts=np.array(rx_tss, dtype=np.uint64),
         timestamp=ts_arr,
     )
 
-    print(f"\n[uwb] Saved {n} frames to {outpath}")
-    print(f"[uwb] {elapsed:.1f}s | {fps:.1f} fps | error rate {err_rate:.1%}")
+    elapsed = time.monotonic() - stats["t0"]
+    print(f"[{tag}] Saved {n} frames to {outpath}  "
+          f"({elapsed:.1f}s, {n / elapsed:.1f} fps)")
+
+
+# ── Initiator capture thread ─────────────────────────────────────────────────
+
+def capture_initiator(port, baud, outpath, stop):
+    tag = "init"
+    try:
+        ser = serial.Serial(port, baud, timeout=0.1)
+        print(f"[{tag}] Opened {port} at {baud} baud")
+    except Exception as e:
+        print(f"[{tag}] Failed to open {port}: {e}")
+        return
+
+    print(f"[{tag}] Recording to {outpath}")
+
+    seqs, tx_tss, timestamps = [], [], []
+
+    def on_frame(result, t):
+        seq, tx_ts = result
+        seqs.append(seq)
+        tx_tss.append(tx_ts)
+        timestamps.append(t)
+
+    with ser:
+        stats = _stream_loop(tag, ser, INIT_FRAME, parse_init_frame,
+                             on_frame, stop)
+
+    n = stats["frames"]
+    if n == 0:
+        print(f"[{tag}] No frames captured.")
+        return
+
+    ts_arr = np.array(timestamps, dtype=np.float64)
+    ts_arr -= ts_arr[0]
+
+    np.savez_compressed(
+        outpath,
+        seq=np.array(seqs, dtype=np.uint16),
+        tx_ts=np.array(tx_tss, dtype=np.uint64),
+        timestamp=ts_arr,
+    )
+
+    elapsed = time.monotonic() - stats["t0"]
+    print(f"[{tag}] Saved {n} frames to {outpath}  "
+          f"({elapsed:.1f}s, {n / elapsed:.1f} fps)")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Capture UWB CIR frames to disk")
-    parser.add_argument("--port", help="Serial port (auto-detected if omitted)")
-    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default 115200)")
+    parser = argparse.ArgumentParser(description="Capture UWB CIR + timestamps")
+    parser.add_argument("--resp-port", help="Responder serial port (auto-detect if omitted)")
+    parser.add_argument("--init-port", help="Initiator serial port (auto-detect if omitted)")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--name", help="Run name (default: timestamp)")
     args = parser.parse_args()
 
-    port = args.port or find_port()
-    capture(port, args.baud)
+    # ── Auto-detect JLink ports ──────────────────────────────────────────
+    resp_port = args.resp_port
+    init_port = args.init_port
+
+    if not resp_port or not init_port:
+        jlinks = find_jlink_ports()
+
+        if not resp_port and not init_port:
+            if len(jlinks) == 0:
+                print("[uwb] No JLink ports found. Use --resp-port / --init-port.")
+                return
+            elif len(jlinks) == 1:
+                resp_port = jlinks[0].device
+                print(f"[uwb] Auto-detected responder: {resp_port} "
+                      f"({jlinks[0].description})")
+                print("[uwb] Only one JLink port found — skipping initiator.")
+            else:
+                resp_port = jlinks[0].device
+                init_port = jlinks[1].device
+                print(f"[uwb] Auto-detected responder: {resp_port} "
+                      f"({jlinks[0].description})")
+                print(f"[uwb] Auto-detected initiator: {init_port} "
+                      f"({jlinks[1].description})")
+                if len(jlinks) > 2:
+                    print(f"[uwb] Note: {len(jlinks)} JLink ports found, "
+                          f"using first two. Override with --resp-port / --init-port.")
+        elif not resp_port:
+            candidates = [p for p in jlinks if p.device != init_port]
+            if candidates:
+                resp_port = candidates[0].device
+                print(f"[uwb] Auto-detected responder: {resp_port} "
+                      f"({candidates[0].description})")
+        elif not init_port:
+            candidates = [p for p in jlinks if p.device != resp_port]
+            if candidates:
+                init_port = candidates[0].device
+                print(f"[uwb] Auto-detected initiator: {init_port} "
+                      f"({candidates[0].description})")
+
+    if not resp_port:
+        print("[uwb] No responder port specified or detected.")
+        return
+
+    # ── Run directory ────────────────────────────────────────────────────
+    default_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if args.name:
+        run_name = args.name
+    else:
+        try:
+            run_name = input(f"[uwb] Run name [{default_name}]: ").strip() or default_name
+        except EOFError:
+            run_name = default_name
+    run_dir  = LOGDIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[uwb] Run: {run_name}")
+
+    # ── Launch capture threads ───────────────────────────────────────────
+    stop    = threading.Event()
+    threads = []
+
+    resp_thread = threading.Thread(
+        target=capture_responder,
+        args=(resp_port, args.baud, run_dir / "resp.npz", stop),
+        daemon=True,
+    )
+    threads.append(resp_thread)
+
+    if init_port:
+        init_thread = threading.Thread(
+            target=capture_initiator,
+            args=(init_port, args.baud, run_dir / "init.npz", stop),
+            daemon=True,
+        )
+        threads.append(init_thread)
+
+    for t in threads:
+        t.start()
+
+    print("[uwb] Press Ctrl+C to stop.\n")
+
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+
+    print("\n[uwb] Stopping...")
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+
+    print("[uwb] Done.")
 
 
 if __name__ == "__main__":

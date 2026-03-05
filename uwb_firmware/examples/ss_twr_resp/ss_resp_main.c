@@ -5,11 +5,12 @@
  *          Listens for any UWB frame, reads the DW1000 CIR accumulator,
  *          and emits a binary frame over UART at 921600 baud.
  *
- *          Binary frame format (4073 bytes):
+ *          Binary frame format (4078 bytes):
  *            [0xBC][0xAD]   2B  sync
  *            [seq]          2B  uint16 LE frame counter
  *            [fp_index]     2B  uint16 LE first path index
  *            [rxpacc]       2B  uint16 LE preamble accumulation count
+ *            [rx_ts]        5B  uint40 LE DW1000 RX timestamp (~15.65 ps/tick)
  *            [cir]       4064B  1016 x (I: int16 LE, Q: int16 LE)
  *            [xor]          1B  XOR checksum of bytes[2:-1]
  * --------------------------------------------------------------------------*/
@@ -48,7 +49,8 @@ static uint8 cir_buf[CIR_BUF_BYTES + 1];
 
 /* -- Binary frame transmit ------------------------------------------------ */
 
-static void send_cir_frame(uint16 seq, uint16 fp_index, uint16 rxpacc)
+static void send_cir_frame(uint16 seq, uint16 fp_index, uint16 rxpacc,
+                            const uint8 *rx_ts)
 {
     uint32 i;
     uint8  xor_val = 0;
@@ -63,6 +65,10 @@ static void send_cir_frame(uint16 seq, uint16 fp_index, uint16 rxpacc)
     SEND_XOR(seq       & 0xFF);  SEND_XOR(seq       >> 8);
     SEND_XOR(fp_index  & 0xFF);  SEND_XOR(fp_index  >> 8);
     SEND_XOR(rxpacc    & 0xFF);  SEND_XOR(rxpacc    >> 8);
+
+    /* DW1000 40-bit RX timestamp, 5 bytes little-endian */
+    for (i = 0; i < 5; i++)
+        SEND_XOR(rx_ts[i]);
 
     for (i = 0; i < CIR_BUF_BYTES; i++)
         SEND_XOR(cir_buf[i + 1]);
@@ -100,14 +106,16 @@ void ss_responder_task_function(void *pvParameter)
         if (status_reg & SYS_STATUS_RXFCG)
         {
             uint16 fp_index, rxpacc;
+            uint8  rx_ts[5];
 
             dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
 
             fp_index = dwt_read16bitoffsetreg(RX_TIME_ID, RX_TIME_FP_INDEX_OFFSET);
             rxpacc   = (dwt_read32bitreg(RX_FINFO_ID) >> RX_FINFO_RXPACC_SHIFT) & 0x0FFF;
+            dwt_readrxtimestamp(rx_ts);
 
             dwt_readaccdata(cir_buf, CIR_BUF_BYTES + 1, 0);
-            send_cir_frame(seq, fp_index, rxpacc);
+            send_cir_frame(seq, fp_index, rxpacc, rx_ts);
 
             LEDS_INVERT(BSP_LED_0_MASK);
             seq++;

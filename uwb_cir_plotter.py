@@ -23,10 +23,14 @@ N_SAMPLES = 1016
 LOGDIR = Path("data/uwb/logs")
 
 
-# ── Load ─────────────────────────────────────────────────────────────────────
+# ── Load ───────────────────────────────────────────────────────────────────
 
 def find_latest_log() -> Path:
-    logs = sorted(LOGDIR.glob("*.npz"), key=lambda p: p.stat().st_mtime)
+    # Prefer resp.npz in run subdirs (data/uwb/logs/<run>/resp.npz)
+    resp_logs = sorted(LOGDIR.glob("*/resp.npz"), key=lambda p: p.stat().st_mtime)
+    # Fallback: legacy cir_*.npz in LOGDIR root
+    legacy_logs = sorted(LOGDIR.glob("*.npz"), key=lambda p: p.stat().st_mtime)
+    logs = resp_logs or legacy_logs
     if not logs:
         print(f"No .npz files found in {LOGDIR}. Run capture_uwb.py first.")
         sys.exit(1)

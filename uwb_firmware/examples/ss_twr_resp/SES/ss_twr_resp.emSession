@@ -2,9 +2,7 @@
 <session>
  <Bookmarks/>
  <Breakpoints groups="Breakpoints" active_group="Breakpoints">
-  <Exceptions>
-   <Group group="V7M Exceptions" set="BusFault;ExceptionEntryReturnFault;HardFault;MemManage;UsageFault_CheckingError;UsageFault_Coprocessor;UsageFault_StateError"/>
-  </Exceptions>
+  <Exceptions/>
  </Breakpoints>
  <ExecutionProfileWindow/>
  <FrameBuffer>
@@ -70,12 +68,12 @@
   <Watches active="0" update="Never"/>
  </Watch4>
  <Files>
-  <SessionOpenFile windowGroup="DockEditLeft" x="0" y="108" useTextEdit="1" path="../main.c" left="0" selected="1" top="99" codecName="Default"/>
+  <SessionOpenFile windowGroup="DockEditLeft" x="30" y="125" useTextEdit="1" path="../main.c" left="0" selected="1" top="103" codecName="Default"/>
   <SessionOpenFile windowGroup="DockEditLeft" x="0" y="29" useTextEdit="1" path="../ss_resp_main.c" left="0" top="10" codecName="Default"/>
   <SessionOpenFile windowGroup="DockEditLeft" x="5" y="1542" useTextEdit="1" path="../../../nRF5_SDK_14.2.0/external/freertos/source/tasks.c" left="0" top="1516" codecName="Default"/>
   <SessionOpenFile windowGroup="DockEditLeft" x="83" y="128" useTextEdit="1" path="../../../nRF5_SDK_14.2.0/external/freertos/config/FreeRTOSConfig.h" left="0" top="117" codecName="Default"/>
   <SessionOpenFile windowGroup="DockEditLeft" x="5" y="2709" useTextEdit="1" path="../../../deca_driver/deca_device.c" left="0" top="2700" codecName="Default"/>
-  <SessionOpenFile windowGroup="DockEditLeft" x="0" y="43" useTextEdit="1" path="../../../nRF5_SDK_14.2.0/components/toolchain/ses/ses_nrf52_startup.s" left="0" top="13" codecName="Default"/>
+  <SessionOpenFile windowGroup="DockEditLeft" x="0" y="43" useTextEdit="1" path="../../../nRF5_SDK_14.2.0/components/toolchain/ses/ses_nrf52_startup.s" left="0" top="14" codecName="Default"/>
  </Files>
  <EMStudioWindow activeProject="ss_twr_resp" fileDialogDefaultFilter="*.c" autoConnectTarget="J-Link" buildConfiguration="nrf52832_xxaa" sessionSettings="" debugSearchFileMap="" fileDialogInitialDirectory="" debugSearchPath="" autoConnectCapabilities="3711"/>
 </session>
