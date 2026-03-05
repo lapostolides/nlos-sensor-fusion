@@ -16,6 +16,7 @@
  * --------------------------------------------------------------------------*/
 
 #include "sdk_config.h"
+#include <stdio.h>
 #include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
@@ -37,6 +38,19 @@ static void uart_send_str(const char *s)
 {
     while (*s)
         uart_putc((uint8)*s++);
+}
+
+static void print_hex(const char *label, const uint8 *data, uint32 len)
+{
+    char msg[64];
+    uart_send_str("CIR:");
+    uart_send_str(label);
+    uart_send_str("=");
+    for (uint32 k = 0; k < len; k++) {
+        snprintf(msg, sizeof(msg), "%02X ", (unsigned int)data[k]);
+        uart_send_str(msg);
+    }
+    uart_send_str("\r\n");
 }
 
 /* -- CIR buffer ----------------------------------------------------------- */
@@ -82,7 +96,6 @@ void ss_responder_task_function(void *pvParameter)
 {
     uint16 seq        = 0;
     uint32 status_reg = 0;
-    uint32 heartbeat  = 0;
 
     UNUSED_PARAMETER(pvParameter);
 
@@ -93,10 +106,6 @@ void ss_responder_task_function(void *pvParameter)
 
     while (1)
     {
-        /* Periodic heartbeat so PuTTY can catch it at any time */
-        if (++heartbeat % 200 == 0)
-            uart_send_str("HB\r\n");
-
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
@@ -108,17 +117,44 @@ void ss_responder_task_function(void *pvParameter)
             uint16 fp_index, rxpacc;
             uint8  rx_ts[5];
 
-            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
+            /* Read accumulator FIRST — before any status clear or RX restart */
+            dwt_readaccdata(cir_buf, CIR_BUF_BYTES + 1, 0);
+
+            {
+                uint8 t1[17], t2[17];
+                /* Treat offset as BYTES */
+                dwt_readaccdata(t1, 16 + 1, 500 * 4);
+                /* Treat offset as SAMPLES (if driver multiplies internally) */
+                dwt_readaccdata(t2, 16 + 1, 500);
+                print_hex("RAW500B", &t1[1], 16);
+                print_hex("RAW500S", &t2[1], 16);
+            }
 
             fp_index = dwt_read16bitoffsetreg(RX_TIME_ID, RX_TIME_FP_INDEX_OFFSET);
             rxpacc   = (dwt_read32bitreg(RX_FINFO_ID) >> RX_FINFO_RXPACC_SHIFT) & 0x0FFF;
             dwt_readrxtimestamp(rx_ts);
 
-            dwt_readaccdata(cir_buf, CIR_BUF_BYTES + 1, 0);
+            /* Clear RXFCG only after we've read and copied everything */
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
+
+            {
+                uint32 nz_bytes = 0;
+                for (uint32 i = 1; i < 1 + CIR_BUF_BYTES; i++) {
+                    if (cir_buf[i] != 0)
+                        nz_bytes++;
+                }
+                char msg[64];
+                snprintf(msg, sizeof(msg), "CIR:NZB=%lu\r\n", (unsigned long)nz_bytes);
+                uart_send_str(msg);
+            }
+
             send_cir_frame(seq, fp_index, rxpacc, rx_ts);
 
             LEDS_INVERT(BSP_LED_0_MASK);
             seq++;
+
+            /* One capture per second for debugging; no dwt_rxenable until next loop */
+            vTaskDelay(1000);
         }
         else
         {
@@ -126,7 +162,5 @@ void ss_responder_task_function(void *pvParameter)
                               SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
             dwt_rxreset();
         }
-
-        vTaskDelay(1);
     }
 }

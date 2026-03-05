@@ -97,60 +97,53 @@ void spi_event_handler(nrf_drv_spi_evt_t const * p_event, void * p_context)
     spi_xfer_done = true;
 }
 
+#define SPI_BUF_SIZE 260
+
+static uint8 spi_tx[SPI_BUF_SIZE];
+static uint8 spi_rx[SPI_BUF_SIZE];
+
 //================================================================================================
 int readfromspi(uint16 headerLength, const uint8 *headerBuffer, uint32 readlength, uint8 *readBuffer)
-{ uint8 * p1;
-  uint32 idatalength=0;
+{
+  uint32 idatalength = headerLength + readlength;
 
-  idatalength= headerLength + readlength;
+  if (idatalength > SPI_BUF_SIZE)
+    return -1;
 
-  uint8 idatabuf[idatalength];
-  uint8 itempbuf[idatalength];
+  memset(spi_tx, 0, idatalength);
+  memset(spi_rx, 0, idatalength);
 
-  memset(idatabuf, 0, idatalength);
-  memset(itempbuf, 0, idatalength);	
-
-  p1=idatabuf;	
-  memcpy(p1,headerBuffer, headerLength);
-
-  p1 += headerLength;
-  memset(p1,0x00,readlength);
+  memcpy(spi_tx, headerBuffer, headerLength);
+  memset(spi_tx + headerLength, 0x00, readlength);
 
   spi_xfer_done = false;
-  nrf_drv_spi_transfer(&spi, idatabuf, idatalength, itempbuf, idatalength);
-  while(!spi_xfer_done)				
-  ;
+  nrf_drv_spi_transfer(&spi, spi_tx, idatalength, spi_rx, idatalength);
+  while (!spi_xfer_done)
+    ;
 
-  p1=itempbuf + headerLength;
-
-  memcpy(readBuffer, p1, readlength);
+  memcpy(readBuffer, spi_rx + headerLength, readlength);
 
   return 0;
 } 
 
 
-int writetospi( uint16 headerLength, const uint8 *headerBuffer, uint32 bodylength, const uint8 *bodyBuffer)
+int writetospi(uint16 headerLength, const uint8 *headerBuffer, uint32 bodylength, const uint8 *bodyBuffer)
 {
-  uint8 * p1;
-  uint32 idatalength=0;
+  uint32 idatalength = headerLength + bodylength;
 
-  idatalength= headerLength + bodylength;
+  if (idatalength > SPI_BUF_SIZE)
+    return -1;
 
-  uint8 idatabuf[idatalength];
-  uint8 itempbuf[idatalength];
+  memset(spi_tx, 0, idatalength);
+  memset(spi_rx, 0, idatalength);
 
-  memset(idatabuf, 0, idatalength);
-  memset(itempbuf, 0, idatalength);		 
-  
-  p1=idatabuf;	
-  memcpy(p1,headerBuffer, headerLength);
-  p1 += headerLength;
-  memcpy(p1,bodyBuffer,bodylength);
-  
+  memcpy(spi_tx, headerBuffer, headerLength);
+  memcpy(spi_tx + headerLength, bodyBuffer, bodylength);
+
   spi_xfer_done = false;
-  nrf_drv_spi_transfer(&spi, idatabuf, idatalength, itempbuf, idatalength);
-  while(!spi_xfer_done)
-                          ;
+  nrf_drv_spi_transfer(&spi, spi_tx, idatalength, spi_rx, idatalength);
+  while (!spi_xfer_done)
+    ;
 
   return 0;
 } 

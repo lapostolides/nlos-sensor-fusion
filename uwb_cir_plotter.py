@@ -42,6 +42,19 @@ def find_latest_log() -> Path:
 def load_log(path: Path) -> dict:
     data = np.load(path)
     n = data["cir"].shape[0]
+    cir = data["cir"]
+
+     # ── Zero I/Q diagnostics ─────────────────────────
+    zero_pairs = np.sum((cir.real == 0) & (cir.imag == 0), axis=1)
+
+    print(f"Loaded {n} frames from {path}")
+    print(f"Zero I/Q pairs per frame (min/mean/max): "
+          f"{zero_pairs.min()} / {zero_pairs.mean():.1f} / {zero_pairs.max()} out of {N_SAMPLES}")
+
+    # Print first few frames for inspection
+    for i in range(min(5, n)):
+        print(f"  frame {i}: {zero_pairs[i]} zero taps")
+
     print(f"Loaded {n} frames from {path}")
     return {
         "cir":       data["cir"],
@@ -64,6 +77,7 @@ def plot_step(log: dict):
 
     fig, ax = plt.subplots(figsize=(13, 5))
     fig.suptitle("CIR Log — Step Through", fontsize=13)
+
 
     sample_axis = np.arange(N_SAMPLES)
     mag = np.roll(np.abs(cir_all[0]), -int(fp_all[0]))

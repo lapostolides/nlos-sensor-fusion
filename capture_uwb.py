@@ -39,15 +39,19 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 
-# ── Responder frame format (4078 bytes) ──────────────────────────────────────
+# ── Responder frame format (fixed length) ───────────────────────────────────────
+#   1. Find 0xBC 0xAD
+#   2. Read exactly 4076 more bytes (payload + xor)
+#   3. Verify XOR, only then decode CIR
 #   sync(2) + seq(2) + fp_index(2) + rxpacc(2) + rx_ts(5) + cir(4064) + xor(1)
-SYNC          = bytes([0xBC, 0xAD])
-RESP_HDR_FMT  = "<HHH"
-RESP_HDR_SIZE = struct.calcsize(RESP_HDR_FMT)        # 6
-RX_TS_SIZE    = 5
-N_SAMPLES     = 1016
-CIR_SIZE      = N_SAMPLES * 4                         # 4064
-RESP_FRAME    = 2 + RESP_HDR_SIZE + RX_TS_SIZE + CIR_SIZE + 1  # 4078
+SYNC                 = bytes([0xBC, 0xAD])
+RESP_BYTES_AFTER_SYNC = 4076   # payload(4075) + xor(1)
+RESP_FRAME            = 2 + RESP_BYTES_AFTER_SYNC    # 4078
+RESP_HDR_FMT          = "<HHH"
+RESP_HDR_SIZE         = struct.calcsize(RESP_HDR_FMT) # 6
+RX_TS_SIZE            = 5
+N_SAMPLES             = 1016
+CIR_SIZE              = N_SAMPLES * 4                 # 4064
 
 # ── Initiator frame format (10 bytes) ────────────────────────────────────────
 #   sync(2) + seq(2) + tx_ts(5) + xor(1)
@@ -85,13 +89,15 @@ def ts40_to_uint64(raw: bytes) -> np.uint64:
 
 
 def parse_resp_frame(raw: bytes):
-    """Parse responder frame (4078B with rx_ts) → (seq, fp_index, rxpacc, rx_ts, cir) or None."""
+    """Fixed-length parse: 1) verify XOR, 2) only then decode CIR. Returns None on failure."""
     if len(raw) != RESP_FRAME:
         return None
-    payload = raw[2:-1]
+
+    payload = raw[2:-1]  # bytes after sync, excluding xor
     if xor_checksum(payload) != raw[-1]:
         return None
 
+    # Decode only after XOR verified
     hdr_end = RESP_HDR_SIZE
     ts_end  = hdr_end + RX_TS_SIZE
 
@@ -101,47 +107,9 @@ def parse_resp_frame(raw: bytes):
 
     iq  = np.frombuffer(payload[ts_end:], dtype="<i2").reshape(N_SAMPLES, 2).astype(np.float32)
     cir = iq[:, 0] + 1j * iq[:, 1]
-    if rxpacc > 0:
-        cir /= rxpacc
+    # No rxpacc normalization for now (debugging)
 
     return seq, fp_index, rxpacc, rx_ts, cir
-
-
-def parse_resp_frame_legacy(raw: bytes):
-    """Parse responder frame (4073B, no rx_ts) → (seq, fp_index, rxpacc, rx_ts, cir) or None."""
-    if len(raw) != RESP_FRAME_LEGACY:
-        return None
-    payload = raw[2:-1]
-    if xor_checksum(payload) != raw[-1]:
-        return None
-
-    hdr_end = RESP_HDR_SIZE
-
-    seq, fp_raw, rxpacc = struct.unpack(RESP_HDR_FMT, payload[:hdr_end])
-    fp_index = min(fp_raw >> 6, N_SAMPLES - 1)
-    rx_ts    = np.uint64(0)  # not present in legacy format
-
-    iq  = np.frombuffer(payload[hdr_end:], dtype="<i2").reshape(N_SAMPLES, 2).astype(np.float32)
-    cir = iq[:, 0] + 1j * iq[:, 1]
-    if rxpacc > 0:
-        cir /= rxpacc
-
-    return seq, fp_index, rxpacc, rx_ts, cir
-
-
-def try_parse_resp(buf: bytearray) -> tuple:
-    """Try parsing responder frame. Returns (result, bytes_consumed) or (None, 0)."""
-    if len(buf) >= RESP_FRAME:
-        raw = bytes(buf[:RESP_FRAME])
-        result = parse_resp_frame(raw)
-        if result is not None:
-            return result, RESP_FRAME
-    if len(buf) >= RESP_FRAME_LEGACY:
-        raw = bytes(buf[:RESP_FRAME_LEGACY])
-        result = parse_resp_frame_legacy(raw)
-        if result is not None:
-            return result, RESP_FRAME_LEGACY
-    return None, 0
 
 
 def parse_init_frame(raw: bytes):
@@ -162,7 +130,7 @@ def parse_init_frame(raw: bytes):
 # ── Generic binary-frame capture loop ────────────────────────────────────────
 
 def _stream_loop(tag, ser, frame_size, parse_fn, on_frame, stop):
-    """Read from *ser*, find SYNC-delimited frames, call on_frame(result, t)."""
+    """Find 0xBC 0xAD, read exactly (frame_size - 2) more bytes, verify XOR, decode."""
     buf = bytearray()
     stats = {
         "frames": 0, "errors": 0, "bytes": 0,
@@ -248,8 +216,7 @@ def capture_responder(port, baud, outpath, stop):
         timestamps.append(t)
 
     with ser:
-        stats = _stream_loop(tag, ser, RESP_FRAME, parse_resp_frame,
-                             on_frame, stop)
+        stats = _stream_loop(tag, ser, RESP_FRAME, parse_resp_frame, on_frame, stop)
 
     n = stats["frames"]
     if n == 0:
