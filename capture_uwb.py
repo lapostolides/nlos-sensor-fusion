@@ -9,7 +9,11 @@ Reads binary frames from two DWM1001-Dev boards over UART:
 Press Ctrl+C to stop and flush to disk.
 
 Responder .npz arrays:
-  cir        (N, 1016) complex64  — normalised complex CIR samples
+  cir        (N, 1016) complex64  — I + jQ (kept for compatibility)
+  cir_i      (N, 1016) float32    — in-phase
+  cir_q      (N, 1016) float32    — quadrature
+  cir_mag    (N, 1016) float32    — |I + jQ|
+  cir_phase  (N, 1016) float32    — phase (radians)
   seq        (N,)      uint16     — firmware frame counter
   fp_index   (N,)      uint16     — first-path index (10.6 → integer)
   rxpacc     (N,)      uint16     — preamble accumulation count
@@ -226,9 +230,19 @@ def capture_responder(port, baud, outpath, stop):
     ts_arr = np.array(timestamps, dtype=np.float64)
     ts_arr -= ts_arr[0]
 
+    cir_arr = np.array(cirs, dtype=np.complex64)
+    cir_i   = cir_arr.real.astype(np.float32)
+    cir_q   = cir_arr.imag.astype(np.float32)
+    cir_mag = np.abs(cir_arr).astype(np.float32)
+    cir_phase = np.angle(cir_arr).astype(np.float32)
+
     np.savez_compressed(
         outpath,
-        cir=np.array(cirs, dtype=np.complex64),
+        cir=cir_arr,
+        cir_i=cir_i,
+        cir_q=cir_q,
+        cir_mag=cir_mag,
+        cir_phase=cir_phase,
         seq=np.array(seqs, dtype=np.uint16),
         fp_index=np.array(fp_idxs, dtype=np.uint16),
         rxpacc=np.array(rxpaccs, dtype=np.uint16),

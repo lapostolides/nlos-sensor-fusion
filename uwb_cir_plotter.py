@@ -44,20 +44,22 @@ def load_log(path: Path) -> dict:
     n = data["cir"].shape[0]
     cir = data["cir"]
 
-     # ── Zero I/Q diagnostics ─────────────────────────
+    # ── Zero I/Q diagnostics ─────────────────────────
     zero_pairs = np.sum((cir.real == 0) & (cir.imag == 0), axis=1)
 
     print(f"Loaded {n} frames from {path}")
     print(f"Zero I/Q pairs per frame (min/mean/max): "
           f"{zero_pairs.min()} / {zero_pairs.mean():.1f} / {zero_pairs.max()} out of {N_SAMPLES}")
 
-    # Print first few frames for inspection
     for i in range(min(5, n)):
         print(f"  frame {i}: {zero_pairs[i]} zero taps")
 
-    print(f"Loaded {n} frames from {path}")
+    # cir_mag if available (new logs), else derive from cir (legacy)
+    cir_mag = data["cir_mag"] if "cir_mag" in data else np.abs(cir)
+
     return {
-        "cir":       data["cir"],
+        "cir":       cir,
+        "cir_mag":   cir_mag,
         "seq":       data["seq"],
         "fp_index":  data["fp_index"],
         "rxpacc":    data["rxpacc"],
@@ -68,19 +70,18 @@ def load_log(path: Path) -> dict:
 # ── Step-through plotter ─────────────────────────────────────────────────────
 
 def plot_step(log: dict):
-    cir_all   = log["cir"]
-    seq_all   = log["seq"]
-    fp_all    = log["fp_index"]
+    cir_mag_all = log["cir_mag"]
+    seq_all     = log["seq"]
+    fp_all     = log["fp_index"]
     rxpacc_all = log["rxpacc"]
-    ts_all    = log["timestamp"]
-    n = cir_all.shape[0]
+    ts_all     = log["timestamp"]
+    n = cir_mag_all.shape[0]
 
     fig, ax = plt.subplots(figsize=(13, 5))
-    fig.suptitle("CIR Log — Step Through", fontsize=13)
-
+    fig.suptitle("CIR Log — Step Through (magnitude)", fontsize=13)
 
     sample_axis = np.arange(N_SAMPLES)
-    mag = np.roll(np.abs(cir_all[0]), -int(fp_all[0]))
+    mag = np.roll(cir_mag_all[0], -int(fp_all[0]))
 
     (line,)   = ax.plot(sample_axis, mag, lw=0.8, color="steelblue")
     fp_line   = ax.axvline(x=0, color="red",    lw=1.5, ls="--", label="First path (index 0)")
@@ -101,7 +102,7 @@ def plot_step(log: dict):
 
     def draw_frame(i):
         fp  = int(fp_all[i])
-        mag = np.roll(np.abs(cir_all[i]), -fp)
+        mag = np.roll(cir_mag_all[i], -fp)
         peak_idx = int(np.argmax(mag))
         fp_peak_ratio = mag[0] / (mag[peak_idx] + 1e-9)
 
@@ -146,13 +147,12 @@ def plot_step(log: dict):
 # ── Waterfall plotter ────────────────────────────────────────────────────────
 
 def plot_waterfall(log: dict):
-    cir_all = log["cir"]
-    fp_all  = log["fp_index"]
-    ts_all  = log["timestamp"]
-    n = cir_all.shape[0]
+    cir_mag_all = log["cir_mag"]
+    fp_all      = log["fp_index"]
+    ts_all = log["timestamp"]
+    n = cir_mag_all.shape[0]
 
-    mag_raw = np.abs(cir_all)
-    mag_all = np.array([np.roll(mag_raw[i], -int(fp_all[i])) for i in range(n)])
+    mag_all = np.array([np.roll(cir_mag_all[i], -int(fp_all[i])) for i in range(n)])
 
     fig, ax = plt.subplots(figsize=(14, 7))
     fig.suptitle(f"CIR Waterfall — {n} frames", fontsize=13)
