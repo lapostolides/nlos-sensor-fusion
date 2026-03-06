@@ -14,7 +14,8 @@
       "Bash(\"C:/Users/lapos/miniconda3/envs/sensor-fusion/Library/bin/colmap.exe\":*)",
       "WebFetch(domain:forum.qorvo.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:cmutschler.de)"
+      "WebFetch(domain:cmutschler.de)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }
