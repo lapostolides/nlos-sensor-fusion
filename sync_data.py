@@ -548,6 +548,14 @@ def main():
         print(f"Error: --uwb-dir {uwb_dir} does not exist.")
         sys.exit(1)
 
+    # Auto-detect UWB data in the same directory as the PKL file
+    # (full_capture.py writes both PKL and UWB .npz to the same run dir).
+    if uwb_dir is None:
+        candidate = path.parent
+        if any(candidate.glob("rx*.npz")):
+            uwb_dir = candidate
+            print(f"Auto-detected UWB data in {uwb_dir}")
+
     sync(path, max_dt_ms=args.max_dt_ms, save=not args.no_index, uwb_dir=uwb_dir)
 
 
