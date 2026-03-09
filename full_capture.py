@@ -38,7 +38,6 @@ from cc_hardware.drivers.spads import SPADSensor
 from cc_hardware.drivers.spads.spad_wrappers import SPADMergeWrapperConfig
 from cc_hardware.drivers.spads.vl53l8ch import VL53L8CHConfig8x8, VL53L8CHConfig4x4
 from cc_hardware.tools.dashboard.spad_dashboard.pyqtgraph import PyQtGraphDashboardConfig
-from cc_hardware.utils.file_handlers import PklHandler
 from cc_hardware.utils.manager import Manager
 print("[full_capture] cc_hardware loaded.", flush=True)
 
@@ -49,6 +48,7 @@ matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 
 from cameras import RGBDCamera, RealsenseCameraWrapper, USBCameraWrapper
+from run_writer import RunWriter
 
 SPAD_CONFIGS        = {"8x8": VL53L8CHConfig8x8, "4x4": VL53L8CHConfig4x4}
 SENSOR_CAM_WINDOW   = "sensor_cam  RealSense RGB+Depth"
@@ -79,7 +79,9 @@ def _sigint_handler(signum, frame):
     if _stop_event is not None:
         _stop_event.set()
     _log("Ctrl+C received — shutting down (press again to force-quit)...")
-    raise KeyboardInterrupt
+    # Don't raise KeyboardInterrupt here — Qt's processEvents() swallows it,
+    # preventing the except clause in run_loop from ever firing.  Instead,
+    # the loop exits via `while not stop.is_set()`.
 
 
 signal.signal(signal.SIGINT, _sigint_handler)
@@ -114,17 +116,63 @@ class LatestFrame:
             return self._data, self._timestamp
 
 
+# ── SPAD port auto-detection ──────────────────────────────────────────
+
+# STMicroelectronics NUCLEO board (VL53L8CH connects via this)
+_SPAD_USB_VID = 0x0483  # STMicroelectronics
+
+
+def find_spad_port() -> str:
+    """Auto-detect the serial port for the VL53L8CH SPAD sensor.
+
+    Identifies the port by USB Vendor ID (STMicroelectronics 0x0483).
+    Raises RuntimeError if no matching port or multiple matches found.
+    """
+    import serial.tools.list_ports
+
+    matches = []
+    for p in serial.tools.list_ports.comports():
+        if p.vid == _SPAD_USB_VID:
+            matches.append(p)
+
+    if not matches:
+        raise RuntimeError(
+            "No SPAD (STMicro) serial port found. "
+            "Is the VL53L8CH NUCLEO board plugged in?"
+        )
+    if len(matches) > 1:
+        ports_str = ", ".join(f"{p.device} ({p.description})" for p in matches)
+        raise RuntimeError(
+            f"Multiple STMicro serial ports found: {ports_str}. "
+            "Unplug extra devices or set SPAD_PORT in capture_config.py."
+        )
+    port = matches[0]
+    _log(f"Auto-detected SPAD on {port.device} ({port.description})")
+    return port.device
+
+
 # ── Sensor Setup ───────────────────────────────────────────────────────
 
 def setup_spad(manager: Manager) -> dict:
-    _log(f"Initializing SPAD ({cfg.SPAD_RESOLUTION}) on {cfg.SPAD_PORT}...")
-    wrapped_config = SPAD_CONFIGS[cfg.SPAD_RESOLUTION].create(port=cfg.SPAD_PORT)
+    port = getattr(cfg, "SPAD_PORT", None) or find_spad_port()
+    _log(f"Initializing SPAD ({cfg.SPAD_RESOLUTION}) on {port}...")
+    wrapped_config = SPAD_CONFIGS[cfg.SPAD_RESOLUTION].create(port=port)
     config = SPADMergeWrapperConfig.create(
         wrapped=wrapped_config,
         data_type="HISTOGRAM",
     )
     sensor = SPADSensor.create_from_config(config)
     assert sensor.is_okay, "SPAD sensor failed to initialize"
+
+    # Force-send initial config to firmware.  VL53L8CHSensor.update() only
+    # sends config.pack() when super().update() returns True (i.e. something
+    # changed).  On first init with no kwargs and no dirty settings, nothing
+    # changes → config is never sent → sensor never starts ranging.
+    inner = sensor.unwrapped if hasattr(sensor, "unwrapped") else sensor
+    if hasattr(inner, "_write_queue"):
+        _log("Sending initial config to SPAD firmware...")
+        inner._write_queue.put(inner.config.pack())
+
     manager.add(spad=sensor)
     _log("SPAD initialized.")
 
@@ -198,22 +246,69 @@ def _setup_cir_figure():
 
 # ── Worker Threads ─────────────────────────────────────────────────────
 
+def _spad_accumulate_with_timeout(sensor, timeout: float = 5.0):
+    """Call sensor.accumulate() with a timeout.
+
+    accumulate() can block forever if the sensor isn't streaming, so we run
+    it in a daemon thread and wait with a timeout.  Returns the data or None.
+    """
+    result = [None]
+    exc = [None]
+
+    def _inner():
+        try:
+            result[0] = sensor.accumulate()
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_inner, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        return None, None  # timed out — accumulate is stuck
+    if exc[0] is not None:
+        return None, exc[0]
+    return result[0], None
+
+
 def _spad_worker(sensor, buf: LatestFrame, stop: threading.Event,
                  start_gate: threading.Event):
     _log("[spad] Worker ready.")
     start_gate.wait()
     _log("[spad] Capturing...")
+    _log(f"[spad] sensor.is_okay = {sensor.is_okay}")
     n = 0
+    errors = 0
+    stall_warned = False
     while not stop.is_set():
-        try:
-            buf.put(sensor.accumulate())
-            n += 1
-            if n == 1:
-                _log("[spad] First frame received.")
-        except Exception as e:
+        data, exc = _spad_accumulate_with_timeout(sensor, timeout=5.0)
+
+        if exc is not None:
+            errors += 1
             if not stop.is_set():
-                print(f"  \033[1;31mSPAD worker: {e}\033[0m", flush=True)
-    _log(f"[spad] Stopped ({n} frames).")
+                print(f"  \033[1;31mSPAD worker error #{errors}: "
+                      f"{type(exc).__name__}: {exc}\033[0m", flush=True)
+            if errors >= 10:
+                _log("[spad] Too many errors, stopping worker.")
+                break
+            continue
+
+        if data is None:
+            # accumulate() timed out
+            if not stall_warned and not stop.is_set():
+                _log("[spad] WARNING: accumulate() timed out — sensor may not be streaming.")
+                _log(f"[spad] sensor.is_okay = {sensor.is_okay}")
+                stall_warned = True
+            continue
+
+        stall_warned = False
+        buf.put(data)
+        n += 1
+        if n == 1:
+            _log(f"[spad] First frame received: type={type(data).__name__}")
+        elif n % 100 == 0:
+            _log(f"[spad] {n} frames accumulated")
+    _log(f"[spad] Stopped ({n} frames, {errors} errors).")
 
 
 def _camera_worker(camera: RGBDCamera, name: str, buf: LatestFrame,
@@ -325,7 +420,7 @@ def _update_display(manager: Manager, idx: int,
 # ── Loop Modes ─────────────────────────────────────────────────────────
 
 def run_loop(
-    manager: Manager, writer: PklHandler,
+    manager: Manager, writer: RunWriter,
     spad_buf: LatestFrame, sensor_cam_buf: LatestFrame, overhead_cam_buf: LatestFrame,
     stop: threading.Event, start_gate: threading.Event,
     cir_state=None,
@@ -348,10 +443,9 @@ def run_loop(
 
     idx = 0
     t0 = time.perf_counter()
-    pace_stall_warned = False
 
     try:
-        while True:
+        while not stop.is_set():
             paced, paced_ts = pace_buf.wait_for_new(timeout=0.1)
             pump_qt()
 
@@ -361,25 +455,8 @@ def run_loop(
                 sd, _ = spad_buf.get()
                 if sc is not None or ov is not None or sd is not None:
                     _update_display(manager, idx, sd, sc, ov, cir_state)
-
-                elapsed = time.perf_counter() - t0
-                if elapsed > 5.0 and not pace_stall_warned:
-                    _log(f"WARNING: '{pace_name}' has not produced data in {elapsed:.0f}s.")
-                    for name, buf, enabled in [
-                        ("SPAD",         spad_buf,         cfg.USE_SPAD),
-                        ("sensor_cam",   sensor_cam_buf,   cfg.USE_SENSOR_CAM),
-                        ("overhead_cam", overhead_cam_buf, cfg.USE_OVERHEAD_CAM),
-                    ]:
-                        if enabled:
-                            d, _ = buf.get()
-                            status = "OK" if d is not None else "no data"
-                            _log(f"    {name:<14} {status}")
-                    pace_stall_warned = True
                 continue
 
-            pace_stall_warned = False
-
-            record = {"iter": idx}
             spad_data = spad_ts = None
             sensor_cam_data = sensor_cam_ts = None
             overhead_cam_data = overhead_cam_ts = None
@@ -390,8 +467,7 @@ def run_loop(
                 else:
                     spad_data, spad_ts = spad_buf.get()
                 if spad_data is not None:
-                    record["spad"] = spad_data
-                    record["spad_timestamp"] = spad_ts
+                    writer.write_spad(spad_data, spad_ts)
 
             if cfg.USE_SENSOR_CAM:
                 if pace_buf is sensor_cam_buf:
@@ -399,8 +475,7 @@ def run_loop(
                 else:
                     sensor_cam_data, sensor_cam_ts = sensor_cam_buf.get()
                 if sensor_cam_data is not None:
-                    record["sensor_cam"] = sensor_cam_data
-                    record["sensor_cam_timestamp"] = sensor_cam_ts
+                    writer.write_sensor_cam(sensor_cam_data, sensor_cam_ts)
 
             if cfg.USE_OVERHEAD_CAM:
                 if pace_buf is overhead_cam_buf:
@@ -408,12 +483,10 @@ def run_loop(
                 else:
                     overhead_cam_data, overhead_cam_ts = overhead_cam_buf.get()
                 if overhead_cam_data is not None:
-                    record["overhead_cam"] = overhead_cam_data
-                    record["overhead_cam_timestamp"] = overhead_cam_ts
+                    writer.write_overhead_cam(overhead_cam_data, overhead_cam_ts)
 
             _update_display(manager, idx, spad_data, sensor_cam_data,
                             overhead_cam_data, cir_state)
-            writer.append(record)
             idx += 1
 
             if idx % 30 == 0:
@@ -421,6 +494,12 @@ def run_loop(
                 _log(f"{idx} frames | {idx / elapsed:.1f} fps | {elapsed:.1f}s")
     except KeyboardInterrupt:
         pass
+
+    # Finalize BEFORE joining workers — _join_workers can block on stuck
+    # threads, and a second Ctrl+C during join triggers os._exit(1) which
+    # skips all finally blocks.  Writing manifest + spad.npz first ensures
+    # captured data is saved even if thread cleanup is interrupted.
+    writer.finalize()
 
     _join_workers(stop, threads)
     elapsed = time.perf_counter() - t0
@@ -430,7 +509,7 @@ def run_loop(
 
 
 def run_manual(
-    manager: Manager, writer: PklHandler,
+    manager: Manager, writer: RunWriter,
     spad_buf: LatestFrame, sensor_cam_buf: LatestFrame, overhead_cam_buf: LatestFrame,
     stop: threading.Event, start_gate: threading.Event,
     cir_state=None,
@@ -445,47 +524,43 @@ def run_manual(
 
     idx = 0
     try:
-        while True:
+        while not stop.is_set():
             pump_qt()
             cmd = input(f"[iter {idx}] Enter=capture, q=quit: ").strip().lower()
             if cmd == "q":
                 break
 
-            record = {"iter": idx}
             spad_data = sensor_cam_data = overhead_cam_data = None
 
             if cfg.USE_SPAD:
                 spad_data, spad_ts = spad_buf.get()
                 if spad_data is not None:
-                    record["spad"] = spad_data
-                    record["spad_timestamp"] = spad_ts
+                    writer.write_spad(spad_data, spad_ts)
                 else:
                     _log("Warning: no SPAD data yet")
 
             if cfg.USE_SENSOR_CAM:
                 sensor_cam_data, sensor_cam_ts = sensor_cam_buf.get()
                 if sensor_cam_data is not None:
-                    record["sensor_cam"] = sensor_cam_data
-                    record["sensor_cam_timestamp"] = sensor_cam_ts
+                    writer.write_sensor_cam(sensor_cam_data, sensor_cam_ts)
                 else:
                     _log("Warning: no sensor_cam data yet")
 
             if cfg.USE_OVERHEAD_CAM:
                 overhead_cam_data, overhead_cam_ts = overhead_cam_buf.get()
                 if overhead_cam_data is not None:
-                    record["overhead_cam"] = overhead_cam_data
-                    record["overhead_cam_timestamp"] = overhead_cam_ts
+                    writer.write_overhead_cam(overhead_cam_data, overhead_cam_ts)
                 else:
                     _log("Warning: no overhead_cam data yet")
 
             _update_display(manager, idx, spad_data, sensor_cam_data,
                             overhead_cam_data, cir_state)
-            writer.append(record)
             _log(f"Captured iter {idx}")
             idx += 1
     except KeyboardInterrupt:
         pass
 
+    writer.finalize()
     _join_workers(stop, threads)
     return idx
 
@@ -511,8 +586,6 @@ def main():
 
     logdir = Path("data/logs") / run_name
     logdir.mkdir(parents=True, exist_ok=True)
-    output = logdir / f"{cfg.OBJECT}_data.pkl"
-    assert not output.exists(), f"{output} already exists"
     _log(f"  output = {logdir}")
 
     # ── Shared events ─────────────────────────────────────────────────
@@ -599,9 +672,7 @@ def main():
                 fig, axes, lines, fp_lines = _setup_cir_figure()
                 cir_state = (fig, axes, lines, fp_lines, cir_bufs)
 
-            writer = PklHandler(output)
-            manager.add(writer=writer)
-            writer.append({"metadata": metadata})
+            writer = RunWriter(logdir, metadata)
 
             active = [n for n, on in [
                 ("SPAD",                      cfg.USE_SPAD),
@@ -625,6 +696,7 @@ def main():
                         overhead_cam_buf, stop, start_gate, cir_state,
                     )
             finally:
+                writer.finalize()
                 # Close dashboard before Manager.__exit__ to avoid
                 # "wrapped C/C++ object has been deleted" RuntimeError.
                 if "dashboard" in manager.components:
@@ -645,7 +717,8 @@ def main():
         for t in uwb_threads:
             t.join(timeout=10)
 
-    _log(f"Done. {count} frames -> {output.resolve()}")
+    counts = writer.counts
+    _log(f"Done. {counts} -> {logdir.resolve()}")
 
 
 if __name__ == "__main__":

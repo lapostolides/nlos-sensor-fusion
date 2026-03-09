@@ -2,29 +2,18 @@
 """
 sync_data.py - Post-hoc temporal synchronization of SPAD, camera, and UWB frames.
 
-Loads a capture PKL file, extracts SPAD and per-camera timestamps, and
-nearest-neighbour matches every SPAD frame to the closest frame from each
-active camera independently.  Warns about pairs that exceed MAX_DT_MS ms.
+Supports two input formats:
 
-Optionally loads UWB data from a directory of .npz files (--uwb-dir).  Each
-RX board (rx1/rx2/rx3) is matched to the nearest SPAD frame.  A separate
-TX→RX nearest-neighbour match is reported when TX data is present.
+  New (manifest.json):
+    python sync_data.py data/logs/my-run/
+    python sync_data.py                              # auto-detect latest run dir
 
-Supported cameras (auto-detected from record keys):
-  sensor_cam   — Intel RealSense RGB-D  (also accepts legacy key 'realsense')
-  overhead_cam — eMeet C960 USB webcam
+  Legacy (PKL):
+    python sync_data.py data/logs/my-run/data.pkl    # explicit PKL path
+    python sync_data.py --uwb-dir data/logs/my-run/  # separate UWB dir
 
-Timestamp layout (per-sensor keys take priority over shared 'timestamp'):
-  {"iter":..., "spad":..., "spad_timestamp":"...",
-               "sensor_cam":...,   "sensor_cam_timestamp":"...",
-               "overhead_cam":..., "overhead_cam_timestamp":"..."}
-
-UWB npz layout (capture_uwb.py output):
-  timestamp             — float64 array, seconds relative to first frame
-  timestamp_wall_start  — float64 scalar, wall-clock epoch at t=0 of capture
-
-Usage:
-    python sync_data.py [path/to/capture.pkl] [--uwb-dir path/to/uwb/run] [--max-dt-ms 100]
+Matches every SPAD frame to the nearest frame from each camera and UWB RX
+board independently.  Writes a sync.json index in the run directory.
 """
 
 import argparse
@@ -47,14 +36,11 @@ except ImportError:
 
 MAX_DT_MS = 100.0
 
-# Maps record data-keys to a canonical camera name.
-# Legacy 'realsense' is treated as 'sensor_cam'.
 _CAM_DATA_KEYS: dict[str, str] = {
     "sensor_cam":   "sensor_cam",
-    "realsense":    "sensor_cam",   # backwards-compat alias
+    "realsense":    "sensor_cam",
     "overhead_cam": "overhead_cam",
 }
-# Corresponding per-sensor timestamp keys
 _CAM_TS_KEYS: dict[str, str] = {
     "sensor_cam":   "sensor_cam_timestamp",
     "realsense":    "realsense_timestamp",
@@ -65,7 +51,29 @@ _UWB_RX_ROLES = ("rx1", "rx2", "rx3")
 _UWB_TX_ROLE  = "tx"
 
 
-# ── I/O ───────────────────────────────────────────────────────────────────────
+# ── I/O — new manifest format ────────────────────────────────────────────────
+
+def _load_manifest_timestamps(
+    run_dir: Path,
+) -> tuple[list[float], dict[str, list[float]]]:
+    """Load SPAD and camera timestamps from manifest.json."""
+    manifest_path = run_dir / "manifest.json"
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    frames = manifest.get("frames", {})
+    spad_ts: list[float] = frames.get("spad", {}).get("timestamps", [])
+
+    cam_ts: dict[str, list[float]] = {}
+    for cam_name in ("sensor_cam", "overhead_cam"):
+        ts = frames.get(cam_name, {}).get("timestamps")
+        if ts:
+            cam_ts[cam_name] = ts
+
+    return spad_ts, cam_ts
+
+
+# ── I/O — legacy PKL format ─────────────────────────────────────────────────
 
 def load_records(path: Path) -> list:
     records = []
@@ -79,28 +87,44 @@ def load_records(path: Path) -> list:
 
 
 def _ts_to_s(ts) -> float:
-    """Convert an ISO timestamp string or a numeric value to seconds since epoch."""
     if isinstance(ts, (int, float)):
         return float(ts)
     return datetime.fromisoformat(str(ts)).timestamp()
 
 
-# ── UWB loading ───────────────────────────────────────────────────────────────
+def _extract_frames_pkl(
+    records: list,
+) -> tuple[list[float], dict[str, list[float]]]:
+    spad_ts: list[float] = []
+    cam_ts: dict[str, list[float]] = {}
+
+    for r in records:
+        if not isinstance(r, dict) or "iter" not in r:
+            continue
+
+        shared = _ts_to_s(r["timestamp"]) if "timestamp" in r else None
+
+        if "spad" in r:
+            t = _ts_to_s(r["spad_timestamp"]) if "spad_timestamp" in r else shared
+            if t is not None:
+                spad_ts.append(t)
+
+        for data_key, canonical in _CAM_DATA_KEYS.items():
+            if data_key not in r:
+                continue
+            ts_key = _CAM_TS_KEYS[data_key]
+            t = _ts_to_s(r[ts_key]) if ts_key in r else shared
+            if t is not None:
+                cam_ts.setdefault(canonical, []).append(t)
+
+    return spad_ts, cam_ts
+
+
+# ── UWB loading ──────────────────────────────────────────────────────────────
 
 def load_uwb_timestamps(
     uwb_dir: Path,
 ) -> tuple[dict[str, list[float]], list[float] | None]:
-    """
-    Load UWB .npz files from *uwb_dir*.
-
-    Requires capture_uwb.py to have saved 'timestamp_wall_start' in each file
-    (captures made after the timestamp_wall_start addition).
-
-    Returns:
-        (rx_ts, tx_ts) where
-          rx_ts  — dict mapping role ('rx1'/'rx2'/'rx3') to list of absolute timestamps
-          tx_ts  — list of absolute TX timestamps, or None if unavailable
-    """
     if not _NUMPY:
         print("  [uwb] numpy not available — skipping UWB sync.")
         return {}, None
@@ -130,46 +154,9 @@ def load_uwb_timestamps(
     return rx_ts, tx_ts
 
 
-# ── Frame extraction ──────────────────────────────────────────────────────────
-
-def _extract_frames(
-    records: list,
-) -> tuple[list[float], dict[str, list[float]]]:
-    """
-    Return (spad_timestamps, cam_timestamps) where cam_timestamps maps each
-    active camera's canonical name to its list of timestamps.
-
-    Only cameras that appear in at least one record are included in the dict.
-    """
-    spad_ts: list[float] = []
-    cam_ts: dict[str, list[float]] = {}
-
-    for r in records:
-        if not isinstance(r, dict) or "iter" not in r:
-            continue
-
-        shared = _ts_to_s(r["timestamp"]) if "timestamp" in r else None
-
-        if "spad" in r:
-            t = _ts_to_s(r["spad_timestamp"]) if "spad_timestamp" in r else shared
-            if t is not None:
-                spad_ts.append(t)
-
-        for data_key, canonical in _CAM_DATA_KEYS.items():
-            if data_key not in r:
-                continue
-            ts_key = _CAM_TS_KEYS[data_key]
-            t = _ts_to_s(r[ts_key]) if ts_key in r else shared
-            if t is not None:
-                cam_ts.setdefault(canonical, []).append(t)
-
-    return spad_ts, cam_ts
-
-
-# ── Nearest-neighbour matching ────────────────────────────────────────────────
+# ── Nearest-neighbour matching ───────────────────────────────────────────────
 
 def _nearest_pool_idx(sorted_pool: list[float], q: float) -> int:
-    """Return the index in *sorted_pool* of the value nearest to *q*."""
     i = bisect.bisect_left(sorted_pool, q)
     if i == 0:
         return 0
@@ -182,13 +169,6 @@ def match_frames(
     spad_ts: list[float],
     cam_ts: dict[str, list[float]],
 ) -> dict[str, list[tuple[int, int, float]]]:
-    """
-    Match every SPAD frame to its nearest frame for each camera independently.
-
-    Returns:
-        Dict mapping camera name -> list of (spad_idx, cam_idx, dt_s) tuples,
-        sorted by spad_idx.
-    """
     all_matches: dict[str, list[tuple[int, int, float]]] = {}
 
     for cam_name, ts_list in cam_ts.items():
@@ -210,15 +190,6 @@ def match_uwb_tx_rx(
     tx_ts: list[float],
     rx_ts: dict[str, list[float]],
 ) -> dict[str, list[tuple[int, int, float]]]:
-    """
-    For each RX role, match every RX frame to its nearest TX frame.
-
-    Both TX and RX timestamps are from time.monotonic() on the same host PC
-    (converted to absolute wall time), so nearest-neighbour is reliable.
-
-    Returns:
-        Dict mapping rx_role -> list of (rx_idx, tx_idx, dt_s) tuples.
-    """
     results: dict[str, list[tuple[int, int, float]]] = {}
     sorted_tx = sorted(range(len(tx_ts)), key=lambda i: tx_ts[i])
     sorted_tx_vals = [tx_ts[i] for i in sorted_tx]
@@ -234,7 +205,7 @@ def match_uwb_tx_rx(
     return results
 
 
-# ── Report ────────────────────────────────────────────────────────────────────
+# ── Report ───────────────────────────────────────────────────────────────────
 
 def _camera_report(
     cam_name: str,
@@ -271,10 +242,9 @@ def _uwb_tx_rx_report(
     rx_ts: dict[str, list[float]],
     tx_n: int,
 ):
-    print(f"\n  [uwb TX→RX]  {tx_n} TX frames")
+    print(f"\n  [uwb TX->RX]  {tx_n} TX frames")
     for role, matches in tx_rx_matches.items():
         n_rx = len(rx_ts[role])
-        used_tx = {ti for _, ti, _ in matches}
         dts_ms = [dt * 1000 for _, _, dt in matches]
         mean_dt = sum(dts_ms) / len(dts_ms) if dts_ms else 0.0
         print(f"    {role}: {n_rx} RX frames -> {len(matches)} matched "
@@ -296,18 +266,15 @@ def report(
     print(sep)
     print(f"  SPAD frames : {n_spad}")
 
-    # Camera + UWB RX matches (all anchored to SPAD)
     for cam_name, matches in all_matches.items():
         n_frames = len(uwb_rx_ts[cam_name.replace("uwb_", "")]) \
             if (uwb_rx_ts and cam_name.startswith("uwb_")) \
             else len(cam_ts.get(cam_name, []))
         _camera_report(cam_name, n_spad, n_frames, matches, max_dt_ms)
 
-    # TX→RX matching (independent of SPAD)
     if uwb_tx_rx_matches and uwb_rx_ts and uwb_tx_ts:
         _uwb_tx_rx_report(uwb_tx_rx_matches, uwb_rx_ts, len(uwb_tx_ts))
 
-    # Overall SPAD cadence
     if n_spad > 1:
         intervals_ms = [(spad_ts[i+1] - spad_ts[i]) * 1000
                         for i in range(len(spad_ts) - 1)]
@@ -317,10 +284,10 @@ def report(
     print(sep)
 
 
-# ── Index export ──────────────────────────────────────────────────────────────
+# ── Index export ─────────────────────────────────────────────────────────────
 
 def save_index(
-    pkl_path: Path,
+    run_dir: Path,
     all_matches: dict[str, list[tuple[int, int, float]]],
     spad_ts: list[float],
     cam_ts: dict[str, list[float]],
@@ -329,23 +296,14 @@ def save_index(
     uwb_tx_ts: list[float] | None = None,
     uwb_tx_rx_matches: dict[str, list[tuple[int, int, float]]] | None = None,
 ) -> Path:
-    """
-    Write a JSON sync index alongside *pkl_path*.
-
-    Each entry in 'pairs' corresponds to one SPAD frame and includes the
-    nearest-matched index from every active camera and UWB RX board.
-
-    Returns the path of the written file.
-    """
-    index_path = pkl_path.with_name(pkl_path.stem + "_sync.json")
+    """Write sync.json in *run_dir*."""
+    index_path = run_dir / "sync.json"
 
     def _iso(ts: float) -> str:
         return datetime.fromtimestamp(ts).isoformat()
 
     n_spad = len(spad_ts)
 
-    # Build per-source lookup: spad_idx -> {idx, dt_ms, ts}
-    # Covers both cameras and UWB RX (which are already merged into all_matches)
     source_lookup: dict[str, dict[int, dict]] = {}
     for name, matches in all_matches.items():
         if name.startswith("uwb_"):
@@ -367,7 +325,6 @@ def save_index(
                 entry[name] = lookup[si]
         pairs.append(entry)
 
-    # Camera stats
     camera_stats = {}
     for cam_name, matches in all_matches.items():
         if cam_name.startswith("uwb_"):
@@ -380,7 +337,6 @@ def save_index(
             "mean_dt_ms": round(sum(dts_ms) / len(dts_ms), 3) if dts_ms else None,
         }
 
-    # UWB RX stats (SPAD-anchored)
     uwb_rx_stats = {}
     for cam_name, matches in all_matches.items():
         if not cam_name.startswith("uwb_"):
@@ -396,7 +352,6 @@ def save_index(
             "mean_dt_ms": round(sum(dts_ms) / len(dts_ms), 3) if dts_ms else None,
         }
 
-    # UWB TX→RX stats
     uwb_tx_rx_stats = {}
     if uwb_tx_rx_matches and uwb_tx_ts:
         for role, matches in uwb_tx_rx_matches.items():
@@ -413,7 +368,7 @@ def save_index(
             }
 
     index = {
-        "source_pkl": str(pkl_path.resolve()),
+        "source": str(run_dir.resolve()),
         "created": datetime.now().isoformat(),
         "max_dt_ms": max_dt_ms,
         "n_spad": n_spad,
@@ -429,47 +384,56 @@ def save_index(
     return index_path
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ───────────────────────────────────────────────────────────────
 
 def sync(
-    pkl_path: Path,
+    run_dir: Path,
     max_dt_ms: float = MAX_DT_MS,
     save: bool = True,
     uwb_dir: Path | None = None,
 ) -> dict[str, list[tuple[int, int, float]]]:
     """
-    Load *pkl_path*, match SPAD frames to each camera and UWB RX board by
-    timestamp, print a summary report, and (if *save* is True) write a JSON
-    index alongside the pkl.
+    Synchronise sensor data from a run directory (manifest.json) or
+    legacy PKL file.
 
-    Args:
-        pkl_path:   Path to the SPAD/camera PKL capture file.
-        max_dt_ms:  Warning threshold for |dt| in milliseconds.
-        save:       Write JSON sync index if True.
-        uwb_dir:    Directory containing UWB .npz files from capture_uwb.py.
-                    Optional — if None, UWB sync is skipped.
+    When *run_dir* points to a directory with manifest.json, timestamps are
+    read directly from the manifest.  UWB data is auto-detected in the same
+    directory.
 
-    Returns:
-        Dict mapping source name -> list of (spad_idx, source_idx, dt_s) pairs.
-        Includes both cameras ('sensor_cam', 'overhead_cam') and UWB RX boards
-        ('uwb_rx1', 'uwb_rx2', 'uwb_rx3') if present.
+    When *run_dir* points to a .pkl file, falls back to legacy PKL parsing.
     """
-    print(f"\nFile: {pkl_path}")
-    records = load_records(pkl_path)
+    # Detect format
+    is_pkl = run_dir.is_file() and run_dir.suffix == ".pkl"
 
-    n_data = sum(1 for r in records if isinstance(r, dict) and "iter" in r)
-    n_meta = len(records) - n_data
-    print(f"Loaded {len(records)} records  ({n_data} data, {n_meta} metadata)\n")
+    if is_pkl:
+        print(f"\nFile: {run_dir} (legacy PKL)")
+        records = load_records(run_dir)
+        n_data = sum(1 for r in records if isinstance(r, dict) and "iter" in r)
+        print(f"Loaded {len(records)} records  ({n_data} data)\n")
+        spad_ts, cam_ts = _extract_frames_pkl(records)
+        effective_dir = run_dir.parent
+    else:
+        manifest_path = run_dir / "manifest.json"
+        if not manifest_path.exists():
+            print(f"Error: {manifest_path} not found.")
+            return {}
+        print(f"\nRun: {run_dir} (manifest.json)")
+        spad_ts, cam_ts = _load_manifest_timestamps(run_dir)
+        print(f"  SPAD: {len(spad_ts)} frames")
+        for name, ts in cam_ts.items():
+            print(f"  {name}: {len(ts)} frames")
+        effective_dir = run_dir
 
-    spad_ts, cam_ts = _extract_frames(records)
-
-    # Load UWB timestamps and merge RX roles into cam_ts under "uwb_rx*" keys
+    # UWB
     uwb_rx_ts: dict[str, list[float]] = {}
     uwb_tx_ts: list[float] | None = None
     uwb_tx_rx_matches: dict[str, list[tuple[int, int, float]]] = {}
 
+    if uwb_dir is None and any(effective_dir.glob("rx*.npz")):
+        uwb_dir = effective_dir
+        print(f"  Auto-detected UWB data in {uwb_dir}")
+
     if uwb_dir is not None:
-        print(f"UWB dir: {uwb_dir}")
         uwb_rx_ts, uwb_tx_ts = load_uwb_timestamps(uwb_dir)
         for role, ts_list in uwb_rx_ts.items():
             cam_ts[f"uwb_{role}"] = ts_list
@@ -493,7 +457,7 @@ def sync(
 
     if save:
         index_path = save_index(
-            pkl_path, all_matches, spad_ts, cam_ts, max_dt_ms,
+            effective_dir, all_matches, spad_ts, cam_ts, max_dt_ms,
             uwb_rx_ts=uwb_rx_ts,
             uwb_tx_ts=uwb_tx_ts,
             uwb_tx_rx_matches=uwb_tx_rx_matches or None,
@@ -503,18 +467,20 @@ def sync(
     return all_matches
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description="Synchronise SPAD, camera, and UWB frames by timestamp."
     )
-    parser.add_argument("pkl", nargs="?", help="Path to capture PKL file.")
+    parser.add_argument(
+        "path", nargs="?",
+        help="Run directory (with manifest.json) or legacy .pkl file.",
+    )
     parser.add_argument(
         "--uwb-dir",
         metavar="DIR",
-        help="Directory containing UWB .npz files (tx.npz, rx1.npz, ...) "
-             "from capture_uwb.py. Optional.",
+        help="Directory containing UWB .npz files. Auto-detected if omitted.",
     )
     parser.add_argument(
         "--max-dt-ms",
@@ -530,31 +496,30 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.pkl:
-        path = Path(args.pkl)
+    if args.path:
+        path = Path(args.path)
         if not path.exists():
             print(f"Error: {path} does not exist.")
             sys.exit(1)
     else:
-        logs = sorted(Path("data/logs").rglob("*.pkl"), key=lambda p: p.stat().st_mtime)
-        if not logs:
-            print("No PKL file found in data/logs/. Pass a path or capture data first.")
+        # Auto-detect: find the most recent run across both formats.
+        # manifest.json dirs → use parent dir; PKL files → use the file itself.
+        candidates: list[Path] = []
+        for mf in Path("data/logs").rglob("manifest.json"):
+            candidates.append(mf.parent)
+        for pk in Path("data/logs").rglob("*.pkl"):
+            candidates.append(pk)
+        if not candidates:
+            print("No run directories or PKL files found in data/logs/.")
             sys.exit(1)
-        path = logs[-1]
+        # Sort by modification time, pick the most recent
+        path = max(candidates, key=lambda p: p.stat().st_mtime)
         print(f"Auto-detected: {path}")
 
     uwb_dir = Path(args.uwb_dir) if args.uwb_dir else None
     if uwb_dir and not uwb_dir.exists():
         print(f"Error: --uwb-dir {uwb_dir} does not exist.")
         sys.exit(1)
-
-    # Auto-detect UWB data in the same directory as the PKL file
-    # (full_capture.py writes both PKL and UWB .npz to the same run dir).
-    if uwb_dir is None:
-        candidate = path.parent
-        if any(candidate.glob("rx*.npz")):
-            uwb_dir = candidate
-            print(f"Auto-detected UWB data in {uwb_dir}")
 
     sync(path, max_dt_ms=args.max_dt_ms, save=not args.no_index, uwb_dir=uwb_dir)
 

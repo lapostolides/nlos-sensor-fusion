@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-playback.py - Play back a recorded capture PKL file.
+playback.py - Play back a recorded capture run.
 
-Shows sensor_cam (RGB + depth) and overhead_cam at the original capture
-rate.  With --gt, YOLO detections are pre-computed and overlaid on the
-overhead_cam window.
+Supports two formats:
+  New:    python playback.py data/logs/my-run/          # directory with manifest.json
+  Legacy: python playback.py data/logs/my-run/data.pkl  # PKL file
 
 Keyboard controls:
-
     Space       pause / resume
     ,  /  .     step one frame backward / forward  (while paused)
-    [  /  ]     0.5× / 2× playback speed
+    [  /  ]     0.5x / 2x playback speed
     q  or Esc   quit
 
 Usage:
-    python playback.py [path/to/capture.pkl] [--speed 1.0] [--gt]
+    python playback.py [path] [--speed 1.0] [--gt]
 """
 
 import argparse
+import json
 import sys
 import time
 from datetime import datetime
@@ -27,14 +27,69 @@ import cv2
 import numpy as np
 
 try:
-    import cloudpickle as pickle  # type: ignore[import-untyped]
+    import cloudpickle as pickle
 except ImportError:
     import pickle
 
 
-# ── Load ──────────────────────────────────────────────────────────────────────
+# ── Load — new manifest format ───────────────────────────────────────────────
 
-def load_records(path: Path) -> list[dict]:
+def _load_manifest_records(run_dir: Path) -> list[dict]:
+    """Build playback-compatible records from the new directory layout."""
+    with open(run_dir / "manifest.json") as f:
+        manifest = json.load(f)
+
+    frames = manifest.get("frames", {})
+    spad_count = frames.get("spad", {}).get("count", 0)
+    sc_count = frames.get("sensor_cam", {}).get("count", 0)
+    ov_count = frames.get("overhead_cam", {}).get("count", 0)
+    n = max(spad_count, sc_count, ov_count)
+
+    sc_ts = frames.get("sensor_cam", {}).get("timestamps", [])
+    ov_ts = frames.get("overhead_cam", {}).get("timestamps", [])
+    spad_ts = frames.get("spad", {}).get("timestamps", [])
+
+    sc_rgb_dir = run_dir / "sensor_cam" / "rgb"
+    sc_depth_dir = run_dir / "sensor_cam" / "depth"
+    ov_dir = run_dir / "overhead_cam"
+
+    records = []
+    for i in range(n):
+        rec: dict = {"iter": i}
+
+        # Timestamp (use first available for pacing)
+        if i < len(sc_ts):
+            rec["sensor_cam_timestamp"] = datetime.fromtimestamp(sc_ts[i]).isoformat()
+        elif i < len(ov_ts):
+            rec["overhead_cam_timestamp"] = datetime.fromtimestamp(ov_ts[i]).isoformat()
+        elif i < len(spad_ts):
+            rec["spad_timestamp"] = datetime.fromtimestamp(spad_ts[i]).isoformat()
+
+        # sensor_cam
+        fname = f"{i:06d}"
+        rgb_path = sc_rgb_dir / f"{fname}.jpg"
+        depth_path = sc_depth_dir / f"{fname}.png"
+        if rgb_path.exists():
+            sc: dict = {"raw_rgb": cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)}
+            if depth_path.exists():
+                sc["aligned_depth"] = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+            rec["sensor_cam"] = sc
+
+        # overhead_cam
+        ov_path = ov_dir / f"{fname}.jpg"
+        if ov_path.exists():
+            rec["overhead_cam"] = {
+                "raw_rgb": cv2.imread(str(ov_path), cv2.IMREAD_COLOR)
+            }
+
+        records.append(rec)
+
+    return records
+
+
+# ── Load — legacy PKL format ────────────────────────────────────────────────
+
+def _load_pkl_records(path: Path) -> list[dict]:
     records = []
     with open(path, "rb") as f:
         try:
@@ -42,14 +97,28 @@ def load_records(path: Path) -> list[dict]:
                 records.append(pickle.load(f))
         except EOFError:
             pass
-    # Drop header / non-data records
     return [r for r in records if isinstance(r, dict) and "iter" in r]
 
 
-# ── Rendering ─────────────────────────────────────────────────────────────────
+def load_records(path: Path) -> list[dict]:
+    """Load records from a run directory or legacy PKL file."""
+    if path.is_dir() and (path / "manifest.json").exists():
+        return _load_manifest_records(path)
+    if path.is_file() and path.suffix == ".pkl":
+        return _load_pkl_records(path)
+    # Try as directory even without manifest (maybe only partial data)
+    if path.is_dir():
+        print(f"Warning: no manifest.json in {path}, trying PKL fallback...")
+        pkls = sorted(path.glob("*.pkl"))
+        if pkls:
+            return _load_pkl_records(pkls[0])
+    print(f"Error: cannot load {path}")
+    sys.exit(1)
+
+
+# ── Rendering ────────────────────────────────────────────────────────────────
 
 def _depth_colormap(depth: np.ndarray) -> np.ndarray:
-    """Convert uint16 depth (mm) to a JET colormap BGR image."""
     return cv2.applyColorMap(
         cv2.convertScaleAbs(depth, alpha=0.03),
         cv2.COLORMAP_JET,
@@ -91,19 +160,15 @@ def build_overhead_cam_frame(rec: dict, display_w: int, display_h: int) -> np.nd
     return cv2.resize(rgb, (display_w, display_h))
 
 
-# ── Ground-truth I/O and overlay ──────────────────────────────────────────────
+# ── Ground-truth I/O and overlay ─────────────────────────────────────────────
 
-def load_gt_for_playback(pkl_path: Path) -> dict[int, list] | None:
-    """
-    Load the sidecar _gt.json for *pkl_path*.  Returns None (with a hint)
-    if the file doesn't exist yet.
-    """
+def load_gt_for_playback(path: Path) -> dict[int, list] | None:
     from ground_truth import load_gt
-    result = load_gt(pkl_path)
+    result = load_gt(path)
     if result is None:
         print(
-            f"\nNo GT file found for {pkl_path.name}.\n"
-            f"Run first:  python ground_truth.py {pkl_path}\n"
+            f"\nNo GT file found for {path.name}.\n"
+            f"Run first:  python ground_truth.py {path}\n"
         )
     return result
 
@@ -114,12 +179,6 @@ def _draw_detections(
     src_w: int,
     src_h: int,
 ) -> np.ndarray:
-    """
-    Draw YOLO person detections onto *img*.
-
-    Pixel coordinates from the detector (src_w × src_h space) are scaled to
-    match the display image size, so this works regardless of resize factor.
-    """
     out = img.copy()
     dw, dh = out.shape[1], out.shape[0]
     sx, sy = dw / src_w, dh / src_h
@@ -135,15 +194,12 @@ def _draw_detections(
         pcx = int(cx * sx)
         pcy = int(cy * sy)
 
-        # Bounding box
         cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        # Centre crosshair
         r = 6
         cv2.line(out, (pcx - r, pcy), (pcx + r, pcy), (0, 255, 0), 2)
         cv2.line(out, (pcx, pcy - r), (pcx, pcy + r), (0, 255, 0), 2)
 
-        # Label — track ID + detection confidence
         tid = f"ID:{loc.track_id}" if loc.track_id is not None else "ID:?"
         label = f"{tid}  {loc.confidence:.0%}"
         lx, ly = x1, max(y1 - 6, 14)
@@ -152,7 +208,6 @@ def _draw_detections(
         cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (0, 255, 0), 1, cv2.LINE_AA)
 
-        # Pose label (shown inside the box when pose estimation was run)
         pose = getattr(loc, "pose", None)
         if pose is not None:
             pose_conf = getattr(loc, "pose_conf", 0.0)
@@ -166,18 +221,16 @@ def _draw_detections(
     return out
 
 
+# ── Playback ─────────────────────────────────────────────────────────────────
 
-
-# ── Playback ──────────────────────────────────────────────────────────────────
-
-SENSOR_WIN  = "sensor_cam  [space=pause  , . = step  [ ] = speed  q=quit]"
+SENSOR_WIN   = "sensor_cam  [space=pause  , . = step  [ ] = speed  q=quit]"
 OVERHEAD_WIN = "overhead_cam"
 
 
 def play(
     records: list[dict],
     speed: float,
-    detections: dict[int, list] | None = None,  # iter -> list[PersonLocation]
+    detections: dict[int, list] | None = None,
     ov_src_w: int = 1920,
     ov_src_h: int = 1080,
 ):
@@ -187,7 +240,6 @@ def play(
 
     n = len(records)
 
-    # Infer per-frame interval from timestamps (fall back to 33 ms)
     def _ts(r: dict) -> float | None:
         for key in ("spad_timestamp", "sensor_cam_timestamp", "overhead_cam_timestamp"):
             if key in r:
@@ -196,13 +248,12 @@ def play(
 
     timestamps = [_ts(r) for r in records]
     intervals: list[float] = [
-        timestamps[i+1] - timestamps[i]   # type: ignore[operator]
+        timestamps[i+1] - timestamps[i]
         for i in range(n - 1)
         if timestamps[i] is not None and timestamps[i+1] is not None
     ]
     base_interval = (sum(intervals) / len(intervals)) if intervals else 0.033
 
-    # Determine overhead display size (half of native to fit on screen)
     _ov_sample = next(
         (r["overhead_cam"]["raw_rgb"] for r in records if "overhead_cam" in r), None
     )
@@ -212,11 +263,10 @@ def play(
     else:
         ov_disp_w, ov_disp_h = 960, 540
 
-    # Create windows
     has_sensor   = any("sensor_cam"   in r for r in records)
     has_overhead = any("overhead_cam" in r for r in records)
 
-    sc_h, sc_w, has_depth = 480, 848, False
+    sc_h, sc_w = 480, 848
     if has_sensor:
         sc0 = next(r for r in records if "sensor_cam" in r)
         sc_h = sc0["sensor_cam"]["raw_rgb"].shape[0]
@@ -235,13 +285,12 @@ def play(
     paused = False
 
     print(f"Playing {n} frames  |  base interval {base_interval*1000:.1f} ms"
-          f"  ({1/base_interval:.1f} fps)  |  speed ×{speed:.1f}")
+          f"  ({1/base_interval:.1f} fps)  |  speed x{speed:.1f}")
     print("  Space=pause  ,/.=step  [/]=speed  q/Esc=quit\n")
 
     while True:
         rec = records[idx]
 
-        # ── Build frames ──
         t_render = time.perf_counter()
         info_lines = [
             f"frame {idx+1}/{n}",
@@ -266,27 +315,26 @@ def play(
                     frame_ov = _draw_detections(frame_ov, locs, ov_src_w, ov_src_h)
             cv2.imshow(OVERHEAD_WIN, frame_ov)
 
-        # ── Keyboard ──
         render_ms   = (time.perf_counter() - t_render) * 1000
         interval_ms = max(1, int(base_interval / speed * 1000) - int(render_ms))
         key = cv2.waitKey(interval_ms if not paused else 30) & 0xFF
 
-        if key in (ord('q'), 27):           # q or Esc
+        if key in (ord('q'), 27):
             break
         elif key == ord(' '):
             paused = not paused
-        elif key == ord(',') and paused:    # step back
+        elif key == ord(',') and paused:
             idx = max(0, idx - 1)
             continue
-        elif key == ord('.') and paused:    # step forward
+        elif key == ord('.') and paused:
             idx = min(n - 1, idx + 1)
             continue
-        elif key == ord('['):               # slower
+        elif key == ord('['):
             speed = max(0.125, speed * 0.5)
-            print(f"Speed: ×{speed:.3f}")
-        elif key == ord(']'):               # faster
+            print(f"Speed: x{speed:.3f}")
+        elif key == ord(']'):
             speed = min(16.0, speed * 2.0)
-            print(f"Speed: ×{speed:.3f}")
+            print(f"Speed: x{speed:.3f}")
 
         if not paused:
             idx += 1
@@ -297,28 +345,36 @@ def play(
     cv2.destroyAllWindows()
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Play back a capture PKL file.")
-    parser.add_argument("pkl", nargs="?", help="Path to capture PKL file.")
+    parser = argparse.ArgumentParser(description="Play back a capture run.")
+    parser.add_argument(
+        "path", nargs="?",
+        help="Run directory (with manifest.json) or legacy .pkl file.",
+    )
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Playback speed multiplier (default 1.0).")
     parser.add_argument("--gt", action="store_true",
-                        help="Overlay ground-truth detections from the _gt.json sidecar.")
+                        help="Overlay ground-truth detections.")
     args = parser.parse_args()
 
-    if args.pkl:
-        path = Path(args.pkl)
+    if args.path:
+        path = Path(args.path)
         if not path.exists():
             print(f"Error: {path} does not exist.")
             sys.exit(1)
     else:
-        logs = sorted(Path("data/logs").rglob("*.pkl"), key=lambda p: p.stat().st_mtime)
-        if not logs:
-            print("No PKL file found in data/logs/. Pass a path or capture data first.")
+        # Auto-detect: most recent run across both formats
+        candidates: list[Path] = []
+        for mf in Path("data/logs").rglob("manifest.json"):
+            candidates.append(mf.parent)
+        for pk in Path("data/logs").rglob("*.pkl"):
+            candidates.append(pk)
+        if not candidates:
+            print("No runs found in data/logs/.")
             sys.exit(1)
-        path = logs[-1]
+        path = max(candidates, key=lambda p: p.stat().st_mtime)
         print(f"Auto-detected: {path}")
 
     print(f"Loading {path} ...")

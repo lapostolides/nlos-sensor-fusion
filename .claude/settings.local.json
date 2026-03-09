@@ -15,7 +15,8 @@
       "WebFetch(domain:forum.qorvo.com)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:cmutschler.de)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(grep:*)"
     ]
   }
 }

@@ -23,7 +23,7 @@ SHOW_UWB_CIR_PREVIEW      = True   # Live matplotlib CIR plot (3 RX subplots)
 
 # ── SPAD (VL53L8CH) ───────────────────────────────────────────────────
 SPAD_RESOLUTION = "4x4"   # "8x8" or "4x4"
-SPAD_PORT       = "COM4"  # Explicit port on Windows to avoid auto-detect mismatch
+SPAD_PORT       = None     # Auto-detect by USB VID (STMicro). Set e.g. "COM4" to override.
 
 # ── sensor_cam (RealSense RGB-D) ───────────────────────────────────────
 SENSOR_CAM_WIDTH  = 848

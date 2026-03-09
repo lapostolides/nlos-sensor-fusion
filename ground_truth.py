@@ -1,12 +1,14 @@
 """
 Ground truth person detection from RGB camera frames using YOLO.
 
-Run as a script to process a PKL log and save detections to a sidecar JSON:
+Run as a script to process a capture run and save detections:
 
-    python ground_truth.py [path/to/capture.pkl] [--model yolov8n.pt] [--conf 0.3]
+    python ground_truth.py data/logs/my-run/               # new format
+    python ground_truth.py data/logs/my-run/data.pkl        # legacy PKL
+    python ground_truth.py --model yolov8n.pt --conf 0.3
 
-The sidecar file is written next to the PKL as <stem>_gt.json and loaded
-automatically by playback.py when --gt is passed.
+The GT file is written as gt.json (run dir) or <stem>_gt.json (PKL) and
+loaded automatically by playback.py when --gt is passed.
 """
 
 import argparse
@@ -134,26 +136,11 @@ class GroundTruthDetector:
         return locations
 
 
-# ── PKL iteration ─────────────────────────────────────────────────────────────
+# ── Frame iteration ──────────────────────────────────────────────────────────
 
-def iter_log(
-    pkl_path: Path | str,
-    detector: GroundTruthDetector,
-    classifier=None,               # Optional[PoseClassifier] from pose_estimation
-    camera_key: str = GT_CAMERA_KEY,
-    normalized: bool = False,
-) -> Iterator[LogDetection]:
-    """
-    Iterate over records in a PKL log file and yield person detections.
-
-    Skips records without a camera frame for *camera_key*.
-
-    If *classifier* is provided (a PoseClassifier), pose is classified for
-    each detected person and stored in ``PersonLocation.pose`` /
-    ``PersonLocation.pose_conf``.  Classification always runs in pixel space;
-    normalization (if requested) is applied afterwards.
-    """
-    with open(Path(pkl_path), "rb") as f:
+def _iter_pkl(pkl_path: Path, camera_key: str) -> Iterator[tuple[int, "np.ndarray"]]:
+    """Yield (iter, frame) from a legacy PKL file."""
+    with open(pkl_path, "rb") as f:
         while True:
             try:
                 record = pickle.load(f)
@@ -164,50 +151,85 @@ def iter_log(
             cam_data = record.get(camera_key)
             if cam_data is None:
                 continue
-            frame = cam_data["raw_rgb"]
+            yield record["iter"], cam_data["raw_rgb"]
 
-            # Always detect in pixel space so the classifier can match keypoints
-            locs = detector.process(frame, normalized=False)
 
-            if classifier is not None and locs:
-                poses = classifier.classify_frame(frame, locs)
-                for loc, p in zip(locs, poses):
-                    loc.pose      = p.pose.value
-                    loc.pose_conf = p.confidence
+def _iter_run_dir(run_dir: Path, camera_key: str) -> Iterator[tuple[int, "np.ndarray"]]:
+    """Yield (iter, frame) from a new-format run directory."""
+    import cv2
+    if camera_key == "overhead_cam":
+        img_dir = run_dir / "overhead_cam"
+    else:
+        img_dir = run_dir / camera_key / "rgb"
+    if not img_dir.exists():
+        return
+    for i, img_path in enumerate(sorted(img_dir.glob("*.jpg"))):
+        frame = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if frame is not None:
+            yield i, frame
 
-            if normalized:
-                h, w = frame.shape[:2]
-                for loc in locs:
-                    bx, by, bw, bh = loc.bbox
-                    cx, cy = loc.center
-                    loc.bbox   = (bx / w, by / h, bw / w, bh / h)
-                    loc.center = (cx / w, cy / h)
 
-            yield LogDetection(iter=record["iter"], locations=locs, frame=frame)
+def iter_log(
+    path: Path | str,
+    detector: GroundTruthDetector,
+    classifier=None,
+    camera_key: str = GT_CAMERA_KEY,
+    normalized: bool = False,
+) -> Iterator[LogDetection]:
+    """
+    Iterate over frames from a run directory or legacy PKL file and yield
+    person detections.
+    """
+    path = Path(path)
+    if path.is_dir() and (path / "manifest.json").exists():
+        frame_iter = _iter_run_dir(path, camera_key)
+    else:
+        frame_iter = _iter_pkl(path, camera_key)
+
+    for iter_idx, frame in frame_iter:
+        locs = detector.process(frame, normalized=False)
+
+        if classifier is not None and locs:
+            poses = classifier.classify_frame(frame, locs)
+            for loc, p in zip(locs, poses):
+                loc.pose      = p.pose.value
+                loc.pose_conf = p.confidence
+
+        if normalized:
+            h, w = frame.shape[:2]
+            for loc in locs:
+                bx, by, bw, bh = loc.bbox
+                cx, cy = loc.center
+                loc.bbox   = (bx / w, by / h, bw / w, bh / h)
+                loc.center = (cx / w, cy / h)
+
+        yield LogDetection(iter=iter_idx, locations=locs, frame=frame)
 
 
 # ── Sidecar JSON I/O ──────────────────────────────────────────────────────────
 
-def gt_path(pkl_path: Path) -> Path:
-    """Return the sidecar GT JSON path for *pkl_path*."""
-    return pkl_path.with_name(pkl_path.stem + "_gt.json")
+def gt_path(path: Path) -> Path:
+    """Return the GT JSON path for a run dir or legacy PKL."""
+    if path.is_dir():
+        return path / "gt.json"
+    return path.with_name(path.stem + "_gt.json")
 
 
 def save_gt(
-    pkl_path: Path,
+    path: Path,
     detections: dict[int, List[PersonLocation]],
     model: str,
     confidence: float,
 ) -> Path:
     """
-    Write detections to a sidecar JSON next to *pkl_path*.
+    Write detections to a GT JSON alongside *path* (run dir or PKL).
 
-    *detections* maps iter → list[PersonLocation] (pixel coords).
+    *detections* maps iter -> list[PersonLocation] (pixel coords).
     Returns the path written.
     """
-    out = gt_path(pkl_path)
+    out = gt_path(path)
     payload = {
-        "source_pkl":          str(pkl_path.resolve()),
+        "source":              str(path.resolve()),
         "model":               model,
         "confidence_threshold": confidence,
         "camera_key":          GT_CAMERA_KEY,
@@ -222,14 +244,14 @@ def save_gt(
     return out
 
 
-def load_gt(pkl_path: Path) -> dict[int, List[PersonLocation]] | None:
+def load_gt(path: Path) -> dict[int, List[PersonLocation]] | None:
     """
-    Load the sidecar GT JSON for *pkl_path*.
+    Load the GT JSON for *path* (run dir or legacy PKL).
 
-    Returns a dict mapping iter → list[PersonLocation], or None if the
-    sidecar does not exist.
+    Returns a dict mapping iter -> list[PersonLocation], or None if the
+    file does not exist.
     """
-    p = gt_path(pkl_path)
+    p = gt_path(path)
     if not p.exists():
         return None
     with open(p) as f:
@@ -243,17 +265,17 @@ def load_gt(pkl_path: Path) -> dict[int, List[PersonLocation]] | None:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _run(
-    pkl_path:    Path,
+    path:        Path,
     model:       str,
     confidence:  float,
     pose_model:  Optional[str] = None,
     device:      Optional[str] = None,
 ) -> None:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"File   : {pkl_path}")
+    print(f"Input  : {path}")
     print(f"Device : {device}")
 
-    existing = gt_path(pkl_path)
+    existing = gt_path(path)
     if existing.exists():
         print(f"Overwriting existing GT file: {existing}")
 
@@ -268,7 +290,7 @@ def _run(
     detections: dict[int, List[PersonLocation]] = {}
     n_frames = n_persons = 0
 
-    for det in iter_log(pkl_path, detector, classifier=classifier, normalized=False):
+    for det in iter_log(path, detector, classifier=classifier, normalized=False):
         detections[det.iter] = det.locations
         n_frames += 1
         n_persons += len(det.locations)
@@ -276,7 +298,7 @@ def _run(
             print(f"  {n_frames} frames processed ...", end="\r")
 
     print(f"  {n_frames} frames processed.       ")
-    out = save_gt(pkl_path, detections, model, confidence)
+    out = save_gt(path, detections, model, confidence)
     print(f"Saved : {out}")
     print(f"Frames with overhead_cam : {n_frames}")
     print(f"Total detections         : {n_persons}")
@@ -294,7 +316,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run YOLO ground-truth detection on a capture PKL and save results."
     )
-    parser.add_argument("pkl", nargs="?", help="Path to capture PKL file.")
+    parser.add_argument(
+        "path", nargs="?",
+        help="Run directory (with manifest.json) or legacy .pkl file.",
+    )
     parser.add_argument("--model", default="models/yolov8n.pt",
                         help="YOLO model (default: yolov8n.pt).")
     parser.add_argument("--conf", type=float, default=0.3,
@@ -315,17 +340,22 @@ def main() -> None:
                         ))
     args = parser.parse_args()
 
-    if args.pkl:
-        path = Path(args.pkl)
+    if args.path:
+        path = Path(args.path)
         if not path.exists():
             print(f"Error: {path} does not exist.")
             sys.exit(1)
     else:
-        logs = sorted(Path("data/logs").rglob("*.pkl"), key=lambda p: p.stat().st_mtime)
-        if not logs:
-            print("No PKL file found in data/logs/.")
+        # Auto-detect: most recent run across both formats
+        candidates: list[Path] = []
+        for mf in Path("data/logs").rglob("manifest.json"):
+            candidates.append(mf.parent)
+        for pk in Path("data/logs").rglob("*.pkl"):
+            candidates.append(pk)
+        if not candidates:
+            print("No runs or PKL files found in data/logs/.")
             sys.exit(1)
-        path = logs[-1]
+        path = max(candidates, key=lambda p: p.stat().st_mtime)
         print(f"Auto-detected: {path}")
 
     _run(path, model=args.model, confidence=args.conf,

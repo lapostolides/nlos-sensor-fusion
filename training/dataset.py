@@ -1,9 +1,13 @@
 """
 training/dataset.py - PyTorch Dataset for synced SPAD + RGB-D pairs.
 
-Reads directly from raw .pkl files using a pre-built byte-offset index so
-the full pkl never needs to be loaded into RAM. Multiple pkl files are
-supported (each pair carries the path to its source pkl).
+Reads from the new run directory format:
+    <run_dir>/
+    ├── manifest.json
+    ├── spad.npz                    # histograms (N, H, W, bins)
+    ├── sensor_cam/rgb/000000.jpg   # BGR uint8
+    ├── sensor_cam/depth/000000.png # uint16 mm
+    └── sync.json                   # frame pairs from sync_data.py
 
 Each __getitem__ returns a dict of plain float32 tensors — no enum keys,
 no driver types — so the default DataLoader collate_fn works unchanged.
@@ -11,32 +15,10 @@ no driver types — so the default DataLoader collate_fn works unchanged.
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-try:
-    import cloudpickle as pickle
-except ImportError:
-    import pickle
-
-
-def _build_offset_index(pkl_path: Path) -> dict[int, int]:
-    """
-    Scan *pkl_path* once and return a mapping of record iter -> byte offset.
-    Enables O(1) random access without loading all records into memory.
-    """
-    offsets: dict[int, int] = {}
-    with open(pkl_path, "rb") as f:
-        try:
-            while True:
-                pos = f.tell()
-                record = pickle.load(f)
-                if isinstance(record, dict) and "iter" in record:
-                    offsets[record["iter"]] = pos
-        except EOFError:
-            pass
-    return offsets
 
 
 class NLOSDataset(Dataset):
@@ -44,40 +26,84 @@ class NLOSDataset(Dataset):
     Dataset of matched SPAD + camera pairs.
 
     Args:
-        pairs: List of pair dicts from the sync index, each augmented with a
-               "pkl_path" key pointing to its source .pkl file.
+        run_dirs: List of run directory paths (each containing sync.json + data).
+        cam_name: Camera to pair with SPAD ('sensor_cam' or 'overhead_cam').
         transform: Optional callable applied to the sample dict before return.
 
     Returns per item (dict):
         spad:  float32 tensor (H, W, bins)  — SPAD histogram, raw counts
-        rgb:   float32 tensor (3, H, W)     — aligned RGB in [0, 1], RGB order
-        depth: float32 tensor (H, W)        — aligned depth in metres (0 = invalid)
-        meta:  dict with dt_ms, spad_idx, cam_idx, pkl_path
+        rgb:   float32 tensor (3, H, W)     — RGB in [0, 1]
+        depth: float32 tensor (H, W)        — depth in metres (0 = invalid)
+        meta:  dict with dt_ms, spad_idx, cam_idx, run_dir
     """
 
-    def __init__(self, pairs: list[dict], transform=None):
-        self.pairs = pairs
+    def __init__(
+        self,
+        run_dirs: list[Path | str],
+        cam_name: str = "sensor_cam",
+        transform=None,
+    ):
+        self.cam_name = cam_name
         self.transform = transform
+        self._pairs: list[dict] = []
+        self._spad_cache: dict[str, np.ndarray] = {}
 
-        # Build one offset index per unique pkl file — scan each pkl once at init.
-        unique_pkls = {p["pkl_path"] for p in pairs}
-        self._offsets: dict[str, dict[int, int]] = {
-            pkl: _build_offset_index(Path(pkl)) for pkl in unique_pkls
-        }
+        for rd in run_dirs:
+            rd = Path(rd)
+            sync_path = rd / "sync.json"
+            if not sync_path.exists():
+                raise FileNotFoundError(
+                    f"sync.json not found in {rd}. Run sync_data.py first."
+                )
+
+            import json
+            with open(sync_path) as f:
+                sync = json.load(f)
+
+            # Load SPAD histograms once per run (memory-mapped for large files)
+            spad_path = rd / "spad.npz"
+            if spad_path.exists():
+                self._spad_cache[str(rd)] = np.load(spad_path)["histograms"]
+
+            for entry in sync["pairs"]:
+                if cam_name not in entry:
+                    continue
+                self._pairs.append({
+                    "run_dir": str(rd),
+                    "spad_idx": entry["spad_idx"],
+                    "cam_idx": entry[cam_name]["idx"],
+                    "dt_ms": entry[cam_name]["dt_ms"],
+                })
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return len(self._pairs)
 
     def __getitem__(self, idx: int) -> dict:
-        pair = self.pairs[idx]
-        pkl = pair["pkl_path"]
+        pair = self._pairs[idx]
+        run_dir = Path(pair["run_dir"])
+        spad_idx = pair["spad_idx"]
+        cam_idx = pair["cam_idx"]
 
-        spad_record = self._load_record(pkl, pair["spad_idx"])
-        cam_record = self._load_record(pkl, pair["cam_idx"])
+        # SPAD
+        histograms = self._spad_cache[pair["run_dir"]]
+        spad = torch.from_numpy(histograms[spad_idx].astype(np.float32))
 
-        spad = self._extract_spad(spad_record)
-        rgb = self._extract_rgb(cam_record)
-        depth = self._extract_depth(cam_record)
+        # RGB
+        rgb_path = run_dir / self.cam_name / "rgb" / f"{cam_idx:06d}.jpg"
+        if not rgb_path.exists():
+            # overhead_cam stores images directly (no rgb/ subdir)
+            rgb_path = run_dir / self.cam_name / f"{cam_idx:06d}.jpg"
+        bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+        rgb = bgr[:, :, ::-1].astype(np.float32) / 255.0
+        rgb = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)
+
+        # Depth (sensor_cam only)
+        depth_path = run_dir / self.cam_name / "depth" / f"{cam_idx:06d}.png"
+        if depth_path.exists():
+            depth_mm = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+            depth = torch.from_numpy(depth_mm.astype(np.float32) / 1000.0)
+        else:
+            depth = torch.zeros(1)
 
         sample = {
             "spad": spad,
@@ -85,9 +111,9 @@ class NLOSDataset(Dataset):
             "depth": depth,
             "meta": {
                 "dt_ms": pair["dt_ms"],
-                "spad_idx": pair["spad_idx"],
-                "cam_idx": pair["cam_idx"],
-                "pkl_path": pkl,
+                "spad_idx": spad_idx,
+                "cam_idx": cam_idx,
+                "run_dir": pair["run_dir"],
             },
         }
 
@@ -95,29 +121,3 @@ class NLOSDataset(Dataset):
             sample = self.transform(sample)
 
         return sample
-
-    # ── Private helpers ────────────────────────────────────────────────────
-
-    def _load_record(self, pkl_path: str, iter_idx: int) -> dict:
-        offset = self._offsets[pkl_path][iter_idx]
-        with open(pkl_path, "rb") as f:
-            f.seek(offset)
-            return pickle.load(f)
-
-    @staticmethod
-    def _extract_spad(record: dict) -> torch.Tensor:
-        # SPAD data is {SPADDataType.HISTOGRAM: np.ndarray (H, W, bins)}.
-        # Extract the array without importing the driver enum.
-        histogram: np.ndarray = next(iter(record["spad"].values()))
-        return torch.from_numpy(histogram.astype(np.float32))  # (H, W, bins)
-
-    @staticmethod
-    def _extract_rgb(record: dict) -> torch.Tensor:
-        bgr: np.ndarray = record["realsense"]["aligned_rgb"]  # uint8 (H, W, 3) BGR
-        rgb = bgr[:, :, ::-1].astype(np.float32) / 255.0      # float32 (H, W, 3) RGB
-        return torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)  # (3, H, W)
-
-    @staticmethod
-    def _extract_depth(record: dict) -> torch.Tensor:
-        depth_mm: np.ndarray = record["realsense"]["aligned_depth"]  # uint16 (H, W)
-        return torch.from_numpy(depth_mm.astype(np.float32) / 1000.0)  # metres (H, W)
