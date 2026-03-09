@@ -138,7 +138,45 @@ int main(void)
   NRF_UART0->CONFIG     = 0;
   NRF_UART0->ENABLE     = 4;
   NRF_UART0->TASKS_STARTTX = 1;
-  
+
+  /* Enable UART RX so Python can send commands */
+  port_uart_enable_rx();
+
+  /* ── Wait for ARM or START before touching DW1000 ─────────────────────────
+   * Protocol (Python → board):
+   *   ID\n    → board replies  ID:<16-hex-chars>\r\n
+   *   ARM\n   → board replies  OK\r\n  then falls through to DW1000 init
+   * ──────────────────────────────────────────────────────────────────────── */
+  {
+    char    id_str[17];
+    char    cmd[8];
+    uint8_t ci = 0;
+    uint8_t ch;
+
+    port_get_device_id(id_str);
+
+    for (;;) {
+      if (!port_uart_try_getc(&ch))
+        continue;
+      if (ch == '\r')
+        continue;
+      if (ch == '\n') {
+        cmd[ci] = '\0';
+        ci = 0;
+        if (strcmp(cmd, "ID") == 0) {
+          port_uart_send_str("ID:");
+          port_uart_send_str(id_str);
+          port_uart_send_str("\r\n");
+        } else if (strcmp(cmd, "ARM") == 0 || strcmp(cmd, "START") == 0) {
+          port_uart_send_str("OK\r\n");
+          break;
+        }
+      } else if (ci < (uint8_t)(sizeof(cmd) - 1)) {
+        cmd[ci++] = (char)ch;
+      }
+    }
+  }
+
   /* Reset DW1000 */
   reset_DW1000(); 
 

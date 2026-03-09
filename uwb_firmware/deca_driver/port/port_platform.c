@@ -224,6 +224,69 @@ void deca_sleep(unsigned int time_ms)
     nrf_delay_ms(time_ms);
 }
 
+/****************************************************************************//**
+ *
+ *                          UART helpers (raw polled NRF_UART0)
+ *
+ * These work alongside readfromspi/writetospi as the HW abstraction layer.
+ * Call port_uart_enable_rx() once after the UART TX setup in main() to
+ * connect pin 11 (DWM1001-DEV J-Link OB RX) and start the receiver.
+ *
+ *******************************************************************************/
+
+void port_uart_putc(uint8_t c)
+{
+    NRF_UART0->EVENTS_TXDRDY = 0;
+    NRF_UART0->TXD = c;
+    while (NRF_UART0->EVENTS_TXDRDY == 0) {}
+}
+
+void port_uart_send_str(const char *s)
+{
+    while (*s)
+        port_uart_putc((uint8_t)*s++);
+}
+
+void port_uart_enable_rx(void)
+{
+    NRF_UART0->PSELRXD       = 11;   /* DWM1001-DEV: J-Link OB UART RX */
+    NRF_UART0->EVENTS_RXDRDY = 0;
+    NRF_UART0->TASKS_STARTRX = 1;
+}
+
+/* Returns 1 and writes the byte if one is ready, 0 otherwise. */
+int port_uart_try_getc(uint8_t *ch)
+{
+    if (NRF_UART0->EVENTS_RXDRDY) {
+        NRF_UART0->EVENTS_RXDRDY = 0;
+        *ch = (uint8_t)NRF_UART0->RXD;
+        return 1;
+    }
+    return 0;
+}
+
+/****************************************************************************//**
+ *
+ *                  nRF52 hardware unique ID (buf must be >= 17 bytes)
+ *
+ * Reads the factory-programmed 64-bit device ID from FICR and formats it as
+ * 16 uppercase hex characters + null terminator, e.g. "A1B2C3D4E5F60718".
+ *
+ *******************************************************************************/
+
+void port_get_device_id(char *buf)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    uint32_t id1 = NRF_FICR->DEVICEID[1];
+    uint32_t id0 = NRF_FICR->DEVICEID[0];
+    int i;
+    for (i = 0; i < 8; i++)
+        buf[i]   = hex[(id1 >> (28 - 4*i)) & 0xF];
+    for (i = 0; i < 8; i++)
+        buf[8+i] = hex[(id0 >> (28 - 4*i)) & 0xF];
+    buf[16] = '\0';
+}
+
 
 // currently do nothing
 decaIrqStatus_t decamutexon(void)           

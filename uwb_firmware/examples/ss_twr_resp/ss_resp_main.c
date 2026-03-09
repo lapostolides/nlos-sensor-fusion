@@ -90,8 +90,26 @@ void ss_responder_task_function(void *pvParameter)
     vTaskDelay(100);
     uart_send_str("CIR:RDY\r\n");
 
+    char    stop_buf[8];
+    uint8_t stop_idx = 0;
+
     while (1)
     {
+        /* Check for STOP\n command from Python */
+        {
+            uint8_t ch;
+            if (port_uart_try_getc(&ch)) {
+                if (ch == '\n') {
+                    stop_buf[stop_idx] = '\0';
+                    stop_idx = 0;
+                    if (strcmp(stop_buf, "STOP") == 0)
+                        vTaskDelete(NULL);
+                } else if (ch != '\r' && stop_idx < (uint8_t)(sizeof(stop_buf) - 1)) {
+                    stop_buf[stop_idx++] = (char)ch;
+                }
+            }
+        }
+
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &

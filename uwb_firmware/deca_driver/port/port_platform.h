@@ -51,6 +51,15 @@ int writetospi( uint16 headerLength, const uint8 *headerBuffer, uint32 bodylengt
 decaIrqStatus_t decamutexon(void);
 void decamutexoff(decaIrqStatus_t s);
 
+/* Raw polled UART helpers — call port_uart_enable_rx() once after UART TX setup */
+void port_uart_putc(uint8_t c);
+void port_uart_send_str(const char *s);
+void port_uart_enable_rx(void);
+int  port_uart_try_getc(uint8_t *ch);
+
+/* 64-bit nRF52 FICR device ID as 16 uppercase hex chars + NUL (buf >= 17 bytes) */
+void port_get_device_id(char *buf);
+
 #if defined(BOARD_DW1001_DEV)
 #define SPI_CS_PIN   17 /**< SPI CS Pin.*/
 #else
