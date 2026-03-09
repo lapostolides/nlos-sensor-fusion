@@ -102,7 +102,7 @@ void ss_initiator_task_function(void *pvParameter)
                     stop_buf[stop_idx] = '\0';
                     stop_idx = 0;
                     if (strcmp(stop_buf, "STOP") == 0)
-                        vTaskDelete(NULL);
+                        NVIC_SystemReset();  /* reboot → back to ID/ARM loop */
                 } else if (ch != '\r' && stop_idx < (uint8_t)(sizeof(stop_buf) - 1)) {
                     stop_buf[stop_idx++] = (char)ch;
                 }

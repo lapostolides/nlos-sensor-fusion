@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
 full_capture.py - Unified multi-sensor capture for NLOS fusion.
-Sensors: SPAD (VL53L8CH), sensor_cam (RealSense RGB-D), overhead_cam (eMeet C960).
-Future: Thermal, UWB.
 
-Each sensor runs in a dedicated background thread to avoid frame-rate drops.
-The main thread handles Qt/OpenCV display and file I/O.
+Sensors: SPAD (VL53L8CH), sensor_cam (RealSense RGB-D),
+         overhead_cam (eMeet C960), UWB (DWM1001-DEV).
 
-Sensor identification guarantees
----------------------------------
-SPAD           : COM port is explicit (cfg.SPAD_PORT) — no ambiguity.
-sensor_cam     : pyrealsense2 only enumerates RealSense hardware; a USB webcam
-                 can never appear here regardless of plug order.
-overhead_cam   : USBCameraWrapper resolves the OpenCV index by Windows device
-                 name via WMI before opening, so plug order does not matter.
+All sensors are initialized and standing by before capture starts.
+A shared start gate releases all threads simultaneously.
+
+All configuration is in capture_config.py — no CLI args. Just run:
+    python full_capture.py
 """
 
 import os
@@ -21,39 +17,78 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["HYDRA_HYDRA_LOGGING__FILE"] = "false"
 os.environ["HYDRA_JOB_LOGGING__FILE"] = "false"
 
+import os as _os
+import signal
+import sys
 import time
 import threading
-import cv2
-import numpy as np
 from pathlib import Path
 from datetime import datetime
 
+print("[full_capture] Starting...", flush=True)
+
+import cv2
+import numpy as np
+
+print("[full_capture] Loading capture_config...", flush=True)
+import capture_config as cfg
+
+print("[full_capture] Loading cc_hardware drivers...", flush=True)
 from cc_hardware.drivers.spads import SPADSensor
 from cc_hardware.drivers.spads.spad_wrappers import SPADMergeWrapperConfig
 from cc_hardware.drivers.spads.vl53l8ch import VL53L8CHConfig8x8, VL53L8CHConfig4x4
 from cc_hardware.tools.dashboard.spad_dashboard.pyqtgraph import PyQtGraphDashboardConfig
 from cc_hardware.utils.file_handlers import PklHandler
 from cc_hardware.utils.manager import Manager
+print("[full_capture] cc_hardware loaded.", flush=True)
+
+# Set matplotlib backend to Qt5Agg BEFORE importing pyplot so it shares
+# the same QApplication as PyQtGraph.
+import matplotlib
+matplotlib.use("Qt5Agg")
+import matplotlib.pyplot as plt
 
 from cameras import RGBDCamera, RealsenseCameraWrapper, USBCameraWrapper
-import capture_config as cfg
 
-NOW = datetime.now()
-LOGDIR = Path("data/logs") / NOW.strftime("%Y-%m-%d") / NOW.strftime("%H-%M-%S")
-
-SPAD_CONFIGS       = {"8x8": VL53L8CHConfig8x8, "4x4": VL53L8CHConfig4x4}
-SENSOR_CAM_WINDOW  = "sensor_cam  RealSense RGB+Depth"
+SPAD_CONFIGS        = {"8x8": VL53L8CHConfig8x8, "4x4": VL53L8CHConfig4x4}
+SENSOR_CAM_WINDOW   = "sensor_cam  RealSense RGB+Depth"
 OVERHEAD_CAM_WINDOW = "overhead_cam  eMeet C960 RGB"
+
+N_SAMPLES  = 1016
+RX_ROLES   = ("rx1", "rx2", "rx3")
+RX_COLORS  = ("steelblue", "tomato", "seagreen")
+
+
+def _log(msg: str):
+    print(f"[full_capture] {msg}", flush=True)
+
+
+# ── Graceful shutdown ─────────────────────────────────────────────────
+# First Ctrl+C  → sets _stop_event, lets cleanup run normally.
+# Second Ctrl+C → force-exits immediately (no waiting for blocked threads).
+
+_stop_event: threading.Event | None = None  # set by main()
+
+
+def _sigint_handler(signum, frame):
+    global _stop_event
+    if _stop_event is not None and _stop_event.is_set():
+        # Second Ctrl+C — force exit
+        _log("Force exit (second Ctrl+C).")
+        _os._exit(1)
+    if _stop_event is not None:
+        _stop_event.set()
+    _log("Ctrl+C received — shutting down (press again to force-quit)...")
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, _sigint_handler)
 
 
 # ── Thread-safe frame buffer ──────────────────────────────────────────
 
 class LatestFrame:
-    """Single-slot buffer holding the most recent frame from a sensor.
-
-    Workers call put() from their thread; the main thread calls get() or
-    wait_for_new() to consume frames.
-    """
+    """Single-slot buffer holding the most recent frame from a sensor."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -62,20 +97,16 @@ class LatestFrame:
         self._has_new = threading.Event()
 
     def put(self, data):
-        """Store a new frame (called from worker thread)."""
         with self._lock:
             self._data = data
             self._timestamp = datetime.now().isoformat()
         self._has_new.set()
 
     def get(self):
-        """Non-blocking read of the latest frame. Returns (data, timestamp)."""
         with self._lock:
             return self._data, self._timestamp
 
     def wait_for_new(self, timeout: float = 2.0):
-        """Block until a new frame arrives, then return (data, timestamp).
-        Returns (None, None) on timeout."""
         if not self._has_new.wait(timeout=timeout):
             return None, None
         self._has_new.clear()
@@ -86,7 +117,7 @@ class LatestFrame:
 # ── Sensor Setup ───────────────────────────────────────────────────────
 
 def setup_spad(manager: Manager) -> dict:
-    """Init VL53L8CH SPAD sensor + optional live dashboard. Returns metadata."""
+    _log(f"Initializing SPAD ({cfg.SPAD_RESOLUTION}) on {cfg.SPAD_PORT}...")
     wrapped_config = SPAD_CONFIGS[cfg.SPAD_RESOLUTION].create(port=cfg.SPAD_PORT)
     config = SPADMergeWrapperConfig.create(
         wrapped=wrapped_config,
@@ -95,8 +126,10 @@ def setup_spad(manager: Manager) -> dict:
     sensor = SPADSensor.create_from_config(config)
     assert sensor.is_okay, "SPAD sensor failed to initialize"
     manager.add(spad=sensor)
+    _log("SPAD initialized.")
 
     if cfg.SHOW_SPAD_DASHBOARD:
+        _log("Setting up SPAD dashboard...")
         dash_cfg = PyQtGraphDashboardConfig.create()
         dashboard = dash_cfg.create_from_registry(config=dash_cfg, sensor=sensor)
         dashboard.setup()
@@ -106,6 +139,7 @@ def setup_spad(manager: Manager) -> dict:
         screen = w.screen().geometry()
         w.move(screen.width() - w.width() - 10, 10)
         w.show()
+        _log("SPAD dashboard ready.")
 
     return {
         "sensor": "VL53L8CH (SPADMergeWrapper)",
@@ -117,17 +151,17 @@ def setup_spad(manager: Manager) -> dict:
 
 
 def _setup_camera(cam: RGBDCamera, manager: Manager, key: str) -> dict:
-    """Open *cam*, register it in *manager* under *key*, return metadata."""
+    _log(f"Initializing {key}...")
     metadata = cam.start()
     assert cam.is_okay, f"Camera '{key}' failed to initialize"
     manager.add(**{key: cam})
+    _log(f"{key} initialized.")
     return metadata
 
 
-# ── Qt Helper ──────────────────────────────────────────────────────────
+# ── Qt / display helpers ──────────────────────────────────────────────
 
 def pump_qt():
-    """Process pending Qt events so the dashboard stays responsive."""
     try:
         from pyqtgraph.Qt import QtWidgets
         app = QtWidgets.QApplication.instance()
@@ -137,24 +171,67 @@ def pump_qt():
         pass
 
 
+def _setup_cir_figure():
+    """Create a matplotlib figure with 3 subplots for live CIR display."""
+    fig, axes = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
+    fig.suptitle("Live UWB CIR", fontsize=12)
+    sample_axis = np.arange(N_SAMPLES)
+
+    lines = {}
+    fp_lines = {}
+    for ax, role, color in zip(axes, RX_ROLES, RX_COLORS):
+        (line,) = ax.plot(sample_axis, np.zeros(N_SAMPLES), lw=0.8,
+                          color=color, label=role)
+        fp_line = ax.axvline(x=0, color=color, lw=1, ls="--", alpha=0.5)
+        ax.set_ylabel(role)
+        ax.set_xlim(0, N_SAMPLES - 1)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+        lines[role] = line
+        fp_lines[role] = fp_line
+
+    axes[-1].set_xlabel("Sample index (FP-aligned)")
+    fig.tight_layout()
+    fig.show()
+    return fig, axes, lines, fp_lines
+
+
 # ── Worker Threads ─────────────────────────────────────────────────────
 
-def _spad_worker(sensor, buf: LatestFrame, stop: threading.Event):
-    """Continuously accumulate SPAD frames into *buf* until *stop* is set."""
+def _spad_worker(sensor, buf: LatestFrame, stop: threading.Event,
+                 start_gate: threading.Event):
+    _log("[spad] Worker ready.")
+    start_gate.wait()
+    _log("[spad] Capturing...")
+    n = 0
     while not stop.is_set():
         try:
             buf.put(sensor.accumulate())
+            n += 1
+            if n == 1:
+                _log("[spad] First frame received.")
         except Exception as e:
             if not stop.is_set():
-                print(f"  \033[1;31mSPAD worker: {e}\033[0m")
+                print(f"  \033[1;31mSPAD worker: {e}\033[0m", flush=True)
+    _log(f"[spad] Stopped ({n} frames).")
 
 
-def _camera_worker(camera: RGBDCamera, buf: LatestFrame, stop: threading.Event):
-    """Continuously capture frames from *camera* into *buf* until *stop* is set."""
+def _camera_worker(camera: RGBDCamera, name: str, buf: LatestFrame,
+                   stop: threading.Event, start_gate: threading.Event):
+    _log(f"[{name}] Worker ready.")
+    start_gate.wait()
+    _log(f"[{name}] Capturing...")
+    n = 0
     while not stop.is_set():
         frame = camera.get_frame(timeout_ms=500)
         if frame is not None:
             buf.put(frame)
+            n += 1
+            if n == 1:
+                shapes = ", ".join(f"{k}: {v.shape}" for k, v in frame.items()
+                                  if hasattr(v, "shape"))
+                _log(f"[{name}] First frame: {shapes}")
+    _log(f"[{name}] Stopped ({n} frames).")
 
 
 def _start_workers(
@@ -163,13 +240,13 @@ def _start_workers(
     sensor_cam_buf: LatestFrame,
     overhead_cam_buf: LatestFrame,
     stop: threading.Event,
+    start_gate: threading.Event,
 ) -> list[threading.Thread]:
-    """Launch background capture threads. Returns the thread list."""
     threads = []
     if cfg.USE_SPAD:
         t = threading.Thread(
             target=_spad_worker,
-            args=(manager.components["spad"], spad_buf, stop),
+            args=(manager.components["spad"], spad_buf, stop, start_gate),
             daemon=True, name="spad-worker",
         )
         t.start()
@@ -177,7 +254,8 @@ def _start_workers(
     if cfg.USE_SENSOR_CAM:
         t = threading.Thread(
             target=_camera_worker,
-            args=(manager.components["sensor_cam"], sensor_cam_buf, stop),
+            args=(manager.components["sensor_cam"], "sensor_cam",
+                  sensor_cam_buf, stop, start_gate),
             daemon=True, name="sensor-cam-worker",
         )
         t.start()
@@ -185,16 +263,17 @@ def _start_workers(
     if cfg.USE_OVERHEAD_CAM:
         t = threading.Thread(
             target=_camera_worker,
-            args=(manager.components["overhead_cam"], overhead_cam_buf, stop),
+            args=(manager.components["overhead_cam"], "overhead_cam",
+                  overhead_cam_buf, stop, start_gate),
             daemon=True, name="overhead-cam-worker",
         )
         t.start()
         threads.append(t)
+    _log(f"Started {len(threads)} sensor worker(s) (waiting on start gate).")
     return threads
 
 
 def _join_workers(stop: threading.Event, threads: list[threading.Thread]):
-    """Signal workers to stop and wait for them."""
     stop.set()
     for t in threads:
         t.join(timeout=3.0)
@@ -203,8 +282,9 @@ def _join_workers(stop: threading.Event, threads: list[threading.Thread]):
 # ── Display (main-thread only) ────────────────────────────────────────
 
 def _update_display(manager: Manager, idx: int,
-                    spad_data, sensor_cam_data, overhead_cam_data):
-    """Push latest sensor data to Qt dashboard and OpenCV windows."""
+                    spad_data, sensor_cam_data, overhead_cam_data,
+                    cir_state=None):
+    """Push latest sensor data to dashboards and preview windows."""
     if spad_data is not None and cfg.SHOW_SPAD_DASHBOARD:
         pump_qt()
         manager.components["dashboard"].update(idx, data=spad_data)
@@ -221,21 +301,39 @@ def _update_display(manager: Manager, idx: int,
         cv2.imshow(OVERHEAD_CAM_WINDOW, overhead_cam_data["raw_rgb"])
         cv2.waitKey(1)
 
+    # Live CIR update (~2fps so only redraw when new data arrives)
+    if cir_state is not None:
+        fig, axes, lines, fp_lines, cir_bufs = cir_state
+        needs_draw = False
+        for role, ax in zip(RX_ROLES, axes):
+            buf = cir_bufs.get(role)
+            if buf is None:
+                continue
+            data, _ = buf.get()
+            if data is None:
+                continue
+            cir_mag, fp_index = data
+            mag = np.roll(cir_mag, -int(fp_index))
+            lines[role].set_ydata(mag)
+            ax.set_ylim(0, float(mag.max()) * 1.15 + 1e-6)
+            needs_draw = True
+        if needs_draw:
+            fig.canvas.draw_idle()
+            pump_qt()
+
 
 # ── Loop Modes ─────────────────────────────────────────────────────────
 
 def run_loop(
     manager: Manager, writer: PklHandler,
     spad_buf: LatestFrame, sensor_cam_buf: LatestFrame, overhead_cam_buf: LatestFrame,
+    stop: threading.Event, start_gate: threading.Event,
+    cir_state=None,
 ):
-    """Continuous threaded capture. Paces on the slowest enabled sensor."""
-    stop = threading.Event()
-    threads = _start_workers(manager, spad_buf, sensor_cam_buf, overhead_cam_buf, stop)
+    threads = _start_workers(
+        manager, spad_buf, sensor_cam_buf, overhead_cam_buf, stop, start_gate,
+    )
 
-    # Pace on a camera rather than SPAD so that recording continues even if the
-    # SPAD serial process hangs (accumulate() blocks forever on an empty queue).
-    # SPAD data is still included each record; it just goes stale if the sensor
-    # drops out rather than stopping recording entirely.
     if cfg.USE_SENSOR_CAM:
         pace_buf, pace_name = sensor_cam_buf, "sensor_cam"
     elif cfg.USE_OVERHEAD_CAM:
@@ -243,37 +341,30 @@ def run_loop(
     else:
         pace_buf, pace_name = spad_buf, "SPAD"
 
-    print("\033[1;36mContinuous capture started (threaded). Press Ctrl+C to stop.\033[0m\n")
+    # Open the gate — all threads start capturing simultaneously.
+    _log("All workers ready. Opening start gate...")
+    start_gate.set()
+    _log(f"Capture running (pacing on {pace_name}). Press Ctrl+C to stop.")
+
     idx = 0
     t0 = time.perf_counter()
-    logged_sensor_cam = False
-    logged_overhead_cam = False
     pace_stall_warned = False
 
     try:
         while True:
-            # Short timeout so Qt events are pumped on every iteration and
-            # camera previews stay live even when the pacing sensor is slow.
             paced, paced_ts = pace_buf.wait_for_new(timeout=0.1)
-
-            # Always pump Qt so the SPAD dashboard stays responsive.
             pump_qt()
 
             if paced is None:
-                # Pacing sensor has no new data — still show cameras so the
-                # user can verify they are working, and warn if it persists.
                 sc, _ = sensor_cam_buf.get()
                 ov, _ = overhead_cam_buf.get()
                 sd, _ = spad_buf.get()
                 if sc is not None or ov is not None or sd is not None:
-                    _update_display(manager, idx, sd, sc, ov)
+                    _update_display(manager, idx, sd, sc, ov, cir_state)
 
                 elapsed = time.perf_counter() - t0
                 if elapsed > 5.0 and not pace_stall_warned:
-                    print(
-                        f"\033[1;31mWarning: '{pace_name}' (pacing sensor) has not "
-                        f"produced data in {elapsed:.0f}s.\033[0m"
-                    )
+                    _log(f"WARNING: '{pace_name}' has not produced data in {elapsed:.0f}s.")
                     for name, buf, enabled in [
                         ("SPAD",         spad_buf,         cfg.USE_SPAD),
                         ("sensor_cam",   sensor_cam_buf,   cfg.USE_SENSOR_CAM),
@@ -281,12 +372,12 @@ def run_loop(
                     ]:
                         if enabled:
                             d, _ = buf.get()
-                            status = "\033[1;32mOK\033[0m" if d is not None else "\033[1;31mno data\033[0m"
-                            print(f"    {name:<14} {status}")
+                            status = "OK" if d is not None else "no data"
+                            _log(f"    {name:<14} {status}")
                     pace_stall_warned = True
                 continue
 
-            pace_stall_warned = False  # reset once pacing sensor resumes
+            pace_stall_warned = False
 
             record = {"iter": idx}
             spad_data = spad_ts = None
@@ -310,13 +401,6 @@ def run_loop(
                 if sensor_cam_data is not None:
                     record["sensor_cam"] = sensor_cam_data
                     record["sensor_cam_timestamp"] = sensor_cam_ts
-                    if not logged_sensor_cam:
-                        print(
-                            f"\033[1;34m[sensor_cam] streaming OK: "
-                            f"RGB {sensor_cam_data['raw_rgb'].shape}, "
-                            f"depth {sensor_cam_data['aligned_depth'].shape}\033[0m"
-                        )
-                        logged_sensor_cam = True
 
             if cfg.USE_OVERHEAD_CAM:
                 if pace_buf is overhead_cam_buf:
@@ -326,45 +410,44 @@ def run_loop(
                 if overhead_cam_data is not None:
                     record["overhead_cam"] = overhead_cam_data
                     record["overhead_cam_timestamp"] = overhead_cam_ts
-                    if not logged_overhead_cam:
-                        print(
-                            f"\033[1;34m[overhead_cam] streaming OK: "
-                            f"RGB {overhead_cam_data['raw_rgb'].shape}\033[0m"
-                        )
-                        logged_overhead_cam = True
 
-            _update_display(manager, idx, spad_data, sensor_cam_data, overhead_cam_data)
+            _update_display(manager, idx, spad_data, sensor_cam_data,
+                            overhead_cam_data, cir_state)
             writer.append(record)
             idx += 1
 
             if idx % 30 == 0:
                 elapsed = time.perf_counter() - t0
-                print(f"  \033[1;33m{idx} frames | {idx / elapsed:.1f} fps | "
-                      f"{elapsed:.1f}s\033[0m")
+                _log(f"{idx} frames | {idx / elapsed:.1f} fps | {elapsed:.1f}s")
     except KeyboardInterrupt:
         pass
 
     _join_workers(stop, threads)
     elapsed = time.perf_counter() - t0
     fps = idx / elapsed if elapsed > 0 else 0
-    print(f"\n\033[1;36mStopped. {idx} frames in {elapsed:.1f}s ({fps:.1f} fps)\033[0m")
+    _log(f"Stopped. {idx} frames in {elapsed:.1f}s ({fps:.1f} fps)")
     return idx
 
 
 def run_manual(
     manager: Manager, writer: PklHandler,
     spad_buf: LatestFrame, sensor_cam_buf: LatestFrame, overhead_cam_buf: LatestFrame,
+    stop: threading.Event, start_gate: threading.Event,
+    cir_state=None,
 ):
-    """Manual capture with background threads. Enter grabs latest frames."""
-    stop = threading.Event()
-    threads = _start_workers(manager, spad_buf, sensor_cam_buf, overhead_cam_buf, stop)
+    threads = _start_workers(
+        manager, spad_buf, sensor_cam_buf, overhead_cam_buf, stop, start_gate,
+    )
+
+    _log("All workers ready. Opening start gate...")
+    start_gate.set()
     time.sleep(0.5)
 
     idx = 0
     try:
         while True:
             pump_qt()
-            cmd = input(f"\033[1;32m[iter {idx}] Enter=capture, q=quit:\033[0m ").strip().lower()
+            cmd = input(f"[iter {idx}] Enter=capture, q=quit: ").strip().lower()
             if cmd == "q":
                 break
 
@@ -377,7 +460,7 @@ def run_manual(
                     record["spad"] = spad_data
                     record["spad_timestamp"] = spad_ts
                 else:
-                    print("  \033[1;33mWarning: no SPAD data yet\033[0m")
+                    _log("Warning: no SPAD data yet")
 
             if cfg.USE_SENSOR_CAM:
                 sensor_cam_data, sensor_cam_ts = sensor_cam_buf.get()
@@ -385,7 +468,7 @@ def run_manual(
                     record["sensor_cam"] = sensor_cam_data
                     record["sensor_cam_timestamp"] = sensor_cam_ts
                 else:
-                    print("  \033[1;33mWarning: no sensor_cam data yet\033[0m")
+                    _log("Warning: no sensor_cam data yet")
 
             if cfg.USE_OVERHEAD_CAM:
                 overhead_cam_data, overhead_cam_ts = overhead_cam_buf.get()
@@ -393,11 +476,12 @@ def run_manual(
                     record["overhead_cam"] = overhead_cam_data
                     record["overhead_cam_timestamp"] = overhead_cam_ts
                 else:
-                    print("  \033[1;33mWarning: no overhead_cam data yet\033[0m")
+                    _log("Warning: no overhead_cam data yet")
 
-            _update_display(manager, idx, spad_data, sensor_cam_data, overhead_cam_data)
+            _update_display(manager, idx, spad_data, sensor_cam_data,
+                            overhead_cam_data, cir_state)
             writer.append(record)
-            print(f"  \033[1;33mCaptured iter {idx}\033[0m")
+            _log(f"Captured iter {idx}")
             idx += 1
     except KeyboardInterrupt:
         pass
@@ -409,24 +493,64 @@ def run_manual(
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
-    LOGDIR.mkdir(parents=True, exist_ok=True)
-    output = LOGDIR / f"{cfg.OBJECT}_data.pkl"
-    assert not output.exists(), f"{output} already exists"
+    _log("=== Configuration ===")
+    _log(f"  SPAD         = {cfg.USE_SPAD}")
+    _log(f"  sensor_cam   = {cfg.USE_SENSOR_CAM}")
+    _log(f"  overhead_cam = {cfg.USE_OVERHEAD_CAM}")
+    _log(f"  UWB          = {cfg.USE_UWB}")
+    _log(f"  mode         = {cfg.CAPTURE_MODE}")
 
-    print(
-        "\033[1;35mConfig:"
-        f" USE_SPAD={cfg.USE_SPAD},"
-        f" USE_SENSOR_CAM={cfg.USE_SENSOR_CAM},"
-        f" USE_OVERHEAD_CAM={cfg.USE_OVERHEAD_CAM}\033[0m"
-    )
+    # ── Run naming ────────────────────────────────────────────────────
+    default_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    try:
+        run_name = input(f"\n[full_capture] Run name [{default_name}]: ").strip()
+    except EOFError:
+        run_name = ""
+    if not run_name:
+        run_name = default_name
+
+    logdir = Path("data/logs") / run_name
+    logdir.mkdir(parents=True, exist_ok=True)
+    output = logdir / f"{cfg.OBJECT}_data.pkl"
+    assert not output.exists(), f"{output} already exists"
+    _log(f"  output = {logdir}")
+
+    # ── Shared events ─────────────────────────────────────────────────
+    stop = threading.Event()
+    start_gate = threading.Event()
+
+    global _stop_event
+    _stop_event = stop
+
+    # ── UWB: discover + arm (waits on start_gate before capturing) ────
+    uwb_threads: list[threading.Thread] = []
+    cir_bufs: dict[str, LatestFrame] = {}
+    if cfg.USE_UWB:
+        _log("=== UWB Setup ===")
+        from capture_uwb import start_uwb_threads
+
+        if cfg.SHOW_UWB_CIR_PREVIEW:
+            for role in RX_ROLES:
+                cir_bufs[role] = LatestFrame()
+
+        baud = getattr(cfg, "UWB_BAUD", 115200)
+        uwb_threads = start_uwb_threads(
+            logdir, stop, baud=baud,
+            start_gate=start_gate,
+            cir_bufs=cir_bufs if cir_bufs else None,
+        )
+        if not uwb_threads:
+            _log("No UWB boards found — continuing without UWB.")
+    else:
+        _log("UWB disabled.")
+
+    # ── SPAD + cameras ────────────────────────────────────────────────
+    _log("=== Sensor Setup ===")
 
     spad_buf         = LatestFrame()
     sensor_cam_buf   = LatestFrame()
     overhead_cam_buf = LatestFrame()
 
-    # Cameras are instantiated before the Manager block so they can be closed
-    # explicitly in `finally`.  Manager only auto-closes cc_hardware Component
-    # objects; raw camera objects are not Components.
     cameras: dict[str, RGBDCamera] = {}
     if cfg.USE_SENSOR_CAM:
         cameras["sensor_cam"] = RealsenseCameraWrapper(
@@ -443,53 +567,85 @@ def main():
 
     try:
         with Manager() as manager:
-            metadata = {"object": cfg.OBJECT, "start_time": NOW.isoformat(), "sensors": {}}
+            metadata = {
+                "object": cfg.OBJECT,
+                "run_name": run_name,
+                "start_time": datetime.now().isoformat(),
+                "sensors": {},
+            }
 
             if cfg.USE_SPAD:
                 metadata["sensors"]["spad"] = setup_spad(manager)
             for key, cam in cameras.items():
                 metadata["sensors"][key] = _setup_camera(cam, manager, key)
 
-            if cfg.SHOW_SENSOR_CAM_PREVIEW:
+            if cfg.USE_SENSOR_CAM and cfg.SHOW_SENSOR_CAM_PREVIEW:
                 cv2.namedWindow(SENSOR_CAM_WINDOW, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(SENSOR_CAM_WINDOW, cfg.SENSOR_CAM_WIDTH * 2, cfg.SENSOR_CAM_HEIGHT)
+                cv2.resizeWindow(SENSOR_CAM_WINDOW, cfg.SENSOR_CAM_WIDTH * 2,
+                                 cfg.SENSOR_CAM_HEIGHT)
                 cv2.moveWindow(SENSOR_CAM_WINDOW, 10, 10)
-            if cfg.SHOW_OVERHEAD_CAM_PREVIEW:
+            if cfg.USE_OVERHEAD_CAM and cfg.SHOW_OVERHEAD_CAM_PREVIEW:
                 cv2.namedWindow(OVERHEAD_CAM_WINDOW, cv2.WINDOW_NORMAL)
                 _ov_w = cfg.OVERHEAD_CAM_WIDTH  // 2
                 _ov_h = cfg.OVERHEAD_CAM_HEIGHT // 2
                 cv2.resizeWindow(OVERHEAD_CAM_WINDOW, _ov_w, _ov_h)
-                cv2.moveWindow(OVERHEAD_CAM_WINDOW, 10, 10 + cfg.SENSOR_CAM_HEIGHT + 40)
+                cv2.moveWindow(OVERHEAD_CAM_WINDOW, 10,
+                               10 + cfg.SENSOR_CAM_HEIGHT + 40)
+
+            # Live CIR figure (matplotlib, shares Qt event loop)
+            cir_state = None
+            if cir_bufs and cfg.SHOW_UWB_CIR_PREVIEW:
+                _log("Setting up live CIR plot...")
+                fig, axes, lines, fp_lines = _setup_cir_figure()
+                cir_state = (fig, axes, lines, fp_lines, cir_bufs)
 
             writer = PklHandler(output)
             manager.add(writer=writer)
             writer.append({"metadata": metadata})
 
             active = [n for n, on in [
-                ("SPAD", cfg.USE_SPAD),
-                ("sensor_cam (RealSense)", cfg.USE_SENSOR_CAM),
+                ("SPAD",                      cfg.USE_SPAD),
+                ("sensor_cam (RealSense)",    cfg.USE_SENSOR_CAM),
                 ("overhead_cam (eMeet C960)", cfg.USE_OVERHEAD_CAM),
+                (f"UWB ({len(uwb_threads)} boards)", bool(uwb_threads)),
             ] if on]
-            print(
-                f"\033[1;36mSensors: {', '.join(active)} | Mode: {cfg.CAPTURE_MODE} "
-                f"(threaded) | Output: {output.resolve()}\033[0m\n"
-            )
 
-            if cfg.CAPTURE_MODE == "loop":
-                count = run_loop(
-                    manager, writer, spad_buf, sensor_cam_buf, overhead_cam_buf,
-                )
-            else:
-                count = run_manual(
-                    manager, writer, spad_buf, sensor_cam_buf, overhead_cam_buf,
-                )
+            _log("=== Capture ===")
+            _log(f"Active sensors: {', '.join(active)}")
+
+            try:
+                if cfg.CAPTURE_MODE == "loop":
+                    count = run_loop(
+                        manager, writer, spad_buf, sensor_cam_buf,
+                        overhead_cam_buf, stop, start_gate, cir_state,
+                    )
+                else:
+                    count = run_manual(
+                        manager, writer, spad_buf, sensor_cam_buf,
+                        overhead_cam_buf, stop, start_gate, cir_state,
+                    )
+            finally:
+                # Close dashboard before Manager.__exit__ to avoid
+                # "wrapped C/C++ object has been deleted" RuntimeError.
+                if "dashboard" in manager.components:
+                    try:
+                        manager.components["dashboard"].close()
+                    except Exception:
+                        pass
+                    del manager.components["dashboard"]
 
     finally:
         for cam in cameras.values():
             cam.close()
         cv2.destroyAllWindows()
+        plt.close("all")
 
-    print(f"\n\033[1;32mDone. {count} frames -> {output.resolve()}\033[0m\n")
+    if uwb_threads:
+        _log("Waiting for UWB threads to finish writing...")
+        for t in uwb_threads:
+            t.join(timeout=10)
+
+    _log(f"Done. {count} frames -> {output.resolve()}")
 
 
 if __name__ == "__main__":

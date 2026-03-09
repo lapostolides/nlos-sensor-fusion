@@ -115,31 +115,59 @@ def parse_init_frame(raw: bytes):
 
 # ── Port identification ───────────────────────────────────────────────────────
 
-def probe_board_id(port: str, baud: int, timeout: float = 2.0) -> "str | None":
-    """Open port, send ID\\n, return the 16-char hex ID string or None."""
+def probe_board_id(port: str, baud: int, timeout: float = 2.0,
+                   retries: int = 3) -> "str | None":
+    """Open port, send ID\\n, return the 16-char hex ID string or None.
+
+    Handles boards stuck in streaming mode (previous run crashed) by sending
+    STOP\\n first to trigger a firmware reboot, then retrying ID\\n.
+    """
     print(f"  {port}: requesting hardware ID...", end="", flush=True)
     try:
         ser = serial.Serial(port, baud, timeout=0.3)
     except Exception as e:
-        print(f"  failed to open ({e})")
+        print(f" failed to open ({e})")
         return None
+
     try:
-        ser.reset_input_buffer()
-        ser.write(b"ID\n")
-        deadline = time.monotonic() + timeout
-        buf = b""
-        while time.monotonic() < deadline:
-            chunk = ser.read(ser.in_waiting or 1)
-            buf += chunk
-            if b"\n" in buf:
-                break
-        for line in buf.decode(errors="replace").splitlines():
-            line = line.strip()
-            if line.startswith("ID:"):
-                hwid = line[3:].strip()
-                print(f" {hwid}")
-                return hwid
-        print("  no response (wrong firmware or board not idle)")
+        for attempt in range(retries):
+            if attempt > 0:
+                # Board may be streaming — send STOP to trigger reboot,
+                # then wait for it to come back up in the ID/ARM loop.
+                print(f" retry {attempt}/{retries-1} (sending STOP to reboot)...",
+                      end="", flush=True)
+                ser.write(b"STOP\n")
+                ser.close()
+                time.sleep(1.5)  # wait for nRF52 reboot (~200ms + margin)
+                try:
+                    ser = serial.Serial(port, baud, timeout=0.3)
+                except Exception as e:
+                    print(f" failed to reopen ({e})")
+                    return None
+
+            ser.reset_input_buffer()
+            # Drain any buffered binary data (board may still be streaming)
+            time.sleep(0.05)
+            ser.read(ser.in_waiting or 0)
+            ser.reset_input_buffer()
+
+            ser.write(b"ID\n")
+            deadline = time.monotonic() + timeout
+            buf = b""
+            while time.monotonic() < deadline:
+                chunk = ser.read(ser.in_waiting or 1)
+                buf += chunk
+                if b"\n" in buf:
+                    break
+
+            for line in buf.decode(errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("ID:"):
+                    hwid = line[3:].strip()
+                    print(f" {hwid}")
+                    return hwid
+
+        print(" no response after retries (check firmware / power cycle)")
         return None
     finally:
         ser.close()
@@ -275,19 +303,26 @@ def _stream_loop(tag, ser, frame_size, parse_fn, on_frame, stop):
 
 # ── Capture threads ───────────────────────────────────────────────────────────
 
-def capture_responder(tag, port, baud, outpath, stop):
+def capture_responder(tag, port, baud, outpath, stop,
+                      start_gate=None, cir_buf=None):
     try:
         ser = serial.Serial(port, baud, timeout=0.1)
-        print(f"[{tag}] Opened {port} at {baud} baud")
+        print(f"[{tag}] Opened {port} at {baud} baud", flush=True)
     except Exception as e:
-        print(f"[{tag}] Failed to open {port}: {e}")
+        print(f"[{tag}] Failed to open {port}: {e}", flush=True)
         return
 
     if not arm_board(ser, tag):
         ser.close()
         return
 
-    print(f"[{tag}] Armed — recording to {outpath}")
+    print(f"[{tag}] Armed — standing by", flush=True)
+
+    if start_gate is not None:
+        start_gate.wait()
+        ser.reset_input_buffer()  # discard data buffered while waiting
+
+    print(f"[{tag}] Capturing → {outpath}", flush=True)
 
     seqs, fp_idxs, rxpaccs, rx_tss, cirs, timestamps = [], [], [], [], [], []
 
@@ -299,6 +334,8 @@ def capture_responder(tag, port, baud, outpath, stop):
         rx_tss.append(rx_ts)
         cirs.append(cir)
         timestamps.append(t)
+        if cir_buf is not None:
+            cir_buf.put((np.abs(cir).astype(np.float32), fp_index))
 
     try:
         stats = _stream_loop(tag, ser, RESP_FRAME, parse_resp_frame, on_frame, stop)
@@ -339,19 +376,25 @@ def capture_responder(tag, port, baud, outpath, stop):
     print(f"[{tag}] Saved {n} frames to {outpath}  ({elapsed:.1f}s, {n/elapsed:.1f} fps)")
 
 
-def capture_initiator(tag, port, baud, outpath, stop):
+def capture_initiator(tag, port, baud, outpath, stop, start_gate=None):
     try:
         ser = serial.Serial(port, baud, timeout=0.1)
-        print(f"[{tag}] Opened {port} at {baud} baud")
+        print(f"[{tag}] Opened {port} at {baud} baud", flush=True)
     except Exception as e:
-        print(f"[{tag}] Failed to open {port}: {e}")
+        print(f"[{tag}] Failed to open {port}: {e}", flush=True)
         return
 
     if not arm_board(ser, tag):
         ser.close()
         return
 
-    print(f"[{tag}] Armed — recording to {outpath}")
+    print(f"[{tag}] Armed — standing by", flush=True)
+
+    if start_gate is not None:
+        start_gate.wait()
+        ser.reset_input_buffer()
+
+    print(f"[{tag}] Capturing → {outpath}", flush=True)
 
     seqs, tx_tss, timestamps = [], [], []
 
@@ -388,6 +431,63 @@ def capture_initiator(tag, port, baud, outpath, stop):
     )
     elapsed = time.monotonic() - stats["t0"]
     print(f"[{tag}] Saved {n} frames to {outpath}  ({elapsed:.1f}s, {n/elapsed:.1f} fps)")
+
+
+# ── Programmatic API (for full_capture.py) ───────────────────────────────────
+
+def start_uwb_threads(
+    run_dir: Path,
+    stop: threading.Event,
+    baud: int = 115200,
+    start_gate: "threading.Event | None" = None,
+    cir_bufs: "dict | None" = None,
+) -> list[threading.Thread]:
+    """
+    Discover UWB board roles, arm them, and start capture threads.
+
+    Designed to be called from full_capture.py so UWB runs in parallel with
+    SPAD and cameras.  .npz files are written to *run_dir* when *stop* is set.
+
+    Args:
+        start_gate: If provided, threads wait on this event after arming
+                    before entering the capture loop.
+        cir_bufs:   Optional dict mapping RX role ('rx1','rx2','rx3') to a
+                    buffer object with a .put((cir_mag, fp_index)) method
+                    for live CIR display.
+
+    Returns the list of started daemon threads, or [] if discovery fails.
+    """
+    role_to_port = discover_roles(baud)
+    if not role_to_port:
+        return []
+
+    missing = {"tx", "rx1", "rx2", "rx3"} - set(role_to_port)
+    if missing:
+        print(f"[uwb] Roles not found: {sorted(missing)} — continuing with {sorted(role_to_port)}",
+              flush=True)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    threads = []
+    print(f"\n[uwb] === Arming {len(role_to_port)} board(s) ===", flush=True)
+    for role, port in sorted(role_to_port.items()):
+        outpath = run_dir / f"{role}.npz"
+        if role == "tx":
+            args = (role, port, baud, outpath, stop, start_gate)
+            fn = capture_initiator
+        else:
+            cir_buf = (cir_bufs or {}).get(role)
+            args = (role, port, baud, outpath, stop, start_gate, cir_buf)
+            fn = capture_responder
+        t = threading.Thread(
+            target=fn,
+            args=args,
+            daemon=True,
+            name=f"uwb-{role}",
+        )
+        t.start()
+        threads.append(t)
+
+    return threads
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
