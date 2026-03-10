@@ -1,0 +1,20 @@
+{
+  "data": {
+    "run_dirs": [],
+    "max_dt_ms": 200.0,
+    "require_gt": true
+  },
+  "model": {
+    "use_spad": false,
+    "use_rgbd": false,
+    "use_uwb": true,
+    "use_pose_head": false
+  },
+  "train": {
+    "max_epochs": 50,
+    "lr": 1e-3
+  },
+  "wandb": {
+    "tags": ["ablation", "uwb-only"]
+  }
+}

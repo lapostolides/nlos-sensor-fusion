@@ -15,8 +15,8 @@ import argparse
 
 import wandb
 
-from training import Config, DataConfig, TrainConfig, WandbConfig
-from training import NLOSDataModule, NLOSModel, Trainer
+from training import Config, DataConfig, ModelConfig, TrainConfig, WandbConfig
+from training import NLOSDataModule, NLOSModel, NLOSFusionModel, Trainer
 
 
 def train(config: Config, model: NLOSModel):
@@ -64,14 +64,8 @@ def main():
     if args.resume:
         config.train.resume_from = args.resume
 
-    # ── Plug in your model here ────────────────────────────────────────────
-    # from my_models import MyFusionModel
-    # model = MyFusionModel(...)
-    # train(config, model)
-    # ──────────────────────────────────────────────────────────────────────
-    raise NotImplementedError(
-        "Instantiate your NLOSModel subclass in train.py before running."
-    )
+    model = NLOSFusionModel(config.model)
+    train(config, model)
 
 
 if __name__ == "__main__":

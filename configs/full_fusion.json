@@ -1,0 +1,20 @@
+{
+  "data": {
+    "run_dirs": [],
+    "max_dt_ms": 100.0,
+    "require_gt": true
+  },
+  "model": {
+    "use_spad": true,
+    "use_rgbd": true,
+    "use_uwb": true,
+    "use_pose_head": true
+  },
+  "train": {
+    "max_epochs": 100,
+    "lr": 5e-4
+  },
+  "wandb": {
+    "tags": ["fusion", "all-sensors"]
+  }
+}

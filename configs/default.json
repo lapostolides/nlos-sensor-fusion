@@ -1,0 +1,46 @@
+{
+  "data": {
+    "run_dirs": [],
+    "max_dt_ms": 100.0,
+    "train_frac": 0.70,
+    "val_frac": 0.15,
+    "seed": 42,
+    "batch_size": 16,
+    "num_workers": 4,
+    "require_gt": true,
+    "gt_camera": "overhead_cam"
+  },
+  "model": {
+    "use_spad": true,
+    "use_rgbd": true,
+    "use_uwb": true,
+    "use_mmwave": false,
+    "embed_dim": 128,
+    "fused_dim": 256,
+    "pretrained_backbone": true,
+    "spad_bins": 8,
+    "spad_spatial": 4,
+    "uwb_n_receivers": 3,
+    "uwb_n_samples": 1016,
+    "use_pose_head": true,
+    "n_pose_classes": 5,
+    "loc_loss_weight": 1.0,
+    "pose_loss_weight": 0.1
+  },
+  "train": {
+    "max_epochs": 100,
+    "lr": 5e-4,
+    "weight_decay": 1e-4,
+    "optimizer": "adamw",
+    "scheduler": "cosine",
+    "grad_clip": 1.0,
+    "log_every_n_steps": 10,
+    "val_every_n_epochs": 1,
+    "checkpoint_dir": "checkpoints/"
+  },
+  "wandb": {
+    "enabled": true,
+    "project": "nlos-fusion",
+    "tags": ["full-fusion"]
+  }
+}
