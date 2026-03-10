@@ -111,18 +111,32 @@ class SyncedViewer:
         self.pairs = data["pairs"]
         self.idx = max(0, min(start, len(self.pairs) - 1))
 
-        # SPAD figure: 4x4 grid of histogram subplots
-        self.fig_spad, self.axes_spad = plt.subplots(4, 4, figsize=(10, 8))
-        self.fig_spad.canvas.manager.set_window_title("SPAD Histograms (4x4)")
-        self.fig_spad.canvas.mpl_connect("key_press_event", self._on_key)
+        # Single figure with GridSpec layout:
+        #   Rows 0-3, Cols 0-3 : SPAD 4x4 histograms
+        #   Rows 0-1, Cols 4-5 : sensor_cam RGB
+        #   Rows 0-1, Cols 6-7 : sensor_cam depth
+        #   Rows 2-3, Cols 4-7 : overhead_cam
+        #   Rows 4-6, Cols 0-7 : UWB CIR (3 stacked)
+        self.fig = plt.figure(figsize=(20, 14))
+        gs = self.fig.add_gridspec(7, 8, hspace=0.45, wspace=0.35)
 
-        # UWB figure: 3 subplots for rx1, rx2, rx3
-        self.fig_uwb, self.axes_uwb = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
-        self.fig_uwb.canvas.manager.set_window_title("UWB CIR (3 RX)")
-        self.fig_uwb.canvas.mpl_connect("key_press_event", self._on_key)
+        # SPAD 4x4
+        self.axes_spad = [[self.fig.add_subplot(gs[r, c]) for c in range(4)]
+                          for r in range(4)]
 
-        # OpenCV windows for cameras
-        self._show_cameras = True
+        # Camera image axes
+        self.ax_rgb = self.fig.add_subplot(gs[0:2, 4:6])
+        self.ax_depth = self.fig.add_subplot(gs[0:2, 6:8])
+        self.ax_overhead = self.fig.add_subplot(gs[2:4, 4:8])
+
+        # UWB CIR (shared x-axis)
+        ax0 = self.fig.add_subplot(gs[4, :])
+        self.axes_uwb = [ax0,
+                         self.fig.add_subplot(gs[5, :], sharex=ax0),
+                         self.fig.add_subplot(gs[6, :], sharex=ax0)]
+
+        self.fig.canvas.manager.set_window_title("Synced Multi-Sensor Viewer")
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
         self._draw()
         plt.show()
@@ -135,13 +149,20 @@ class SyncedViewer:
             self.idx = max(self.idx - 1, 0)
             self._draw()
         elif event.key in ("q", "escape"):
-            cv2.destroyAllWindows()
             plt.close("all")
+
+    @staticmethod
+    def _clear_image_ax(ax, text="N/A"):
+        ax.clear()
+        ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
 
     def _draw(self):
         pair = self.pairs[self.idx]
         spad_idx = pair["spad_idx"]
-        title_base = f"Pair {self.idx}/{len(self.pairs)-1}  |  SPAD #{spad_idx}"
+        title = (f"Pair {self.idx}/{len(self.pairs)-1}  |  "
+                 f"SPAD #{spad_idx}  |  ts: {pair['spad_ts']}")
 
         # ── SPAD histograms ─────────────────────────────────────────────
         if self.data["spad_histograms"] is not None and spad_idx < len(self.data["spad_histograms"]):
@@ -162,9 +183,51 @@ class SyncedViewer:
                     self.axes_spad[r][c].text(0.5, 0.5, "N/A", ha="center", va="center",
                                                transform=self.axes_spad[r][c].transAxes)
 
-        self.fig_spad.suptitle(f"{title_base}  |  ts: {pair['spad_ts']}", fontsize=10)
-        self.fig_spad.tight_layout(rect=[0, 0, 1, 0.95])
-        self.fig_spad.canvas.draw_idle()
+        # ── Camera frames ───────────────────────────────────────────────
+        sc = pair.get("sensor_cam")
+        if sc is not None:
+            rgb = load_image(self.data["sensor_cam_rgb_dir"], sc["idx"])
+            if rgb is not None:
+                self.ax_rgb.clear()
+                self.ax_rgb.imshow(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB), aspect="auto")
+                self.ax_rgb.set_title(f"sensor_cam #{sc['idx']}  dt={sc['dt_ms']:.1f}ms", fontsize=8)
+                self.ax_rgb.set_xticks([])
+                self.ax_rgb.set_yticks([])
+            else:
+                self._clear_image_ax(self.ax_rgb, "RGB: no file")
+
+            depth = load_image(self.data["sensor_cam_depth_dir"], sc["idx"])
+            if depth is not None:
+                self.ax_depth.clear()
+                if depth.dtype == np.uint16:
+                    disp = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    disp = cv2.applyColorMap(disp, cv2.COLORMAP_TURBO)
+                    disp = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+                else:
+                    disp = depth if depth.ndim == 2 else cv2.cvtColor(depth, cv2.COLOR_BGR2RGB)
+                self.ax_depth.imshow(disp, aspect="auto")
+                self.ax_depth.set_title(f"depth #{sc['idx']}", fontsize=8)
+                self.ax_depth.set_xticks([])
+                self.ax_depth.set_yticks([])
+            else:
+                self._clear_image_ax(self.ax_depth, "Depth: no file")
+        else:
+            self._clear_image_ax(self.ax_rgb, "sensor_cam: N/A")
+            self._clear_image_ax(self.ax_depth, "depth: N/A")
+
+        oc = pair.get("overhead_cam")
+        if oc is not None:
+            oh = load_image(self.data["overhead_cam_dir"], oc["idx"])
+            if oh is not None:
+                self.ax_overhead.clear()
+                self.ax_overhead.imshow(cv2.cvtColor(oh, cv2.COLOR_BGR2RGB), aspect="auto")
+                self.ax_overhead.set_title(f"overhead_cam #{oc['idx']}  dt={oc['dt_ms']:.1f}ms", fontsize=8)
+                self.ax_overhead.set_xticks([])
+                self.ax_overhead.set_yticks([])
+            else:
+                self._clear_image_ax(self.ax_overhead, "overhead: no file")
+        else:
+            self._clear_image_ax(self.ax_overhead, "overhead_cam: N/A")
 
         # ── UWB CIR ────────────────────────────────────────────────────
         for i, role in enumerate(("rx1", "rx2", "rx3")):
@@ -195,41 +258,9 @@ class SyncedViewer:
 
             ax.set_ylabel("Magnitude", fontsize=8)
         self.axes_uwb[-1].set_xlabel("CIR Sample Index", fontsize=8)
-        self.fig_uwb.suptitle(title_base, fontsize=10)
-        self.fig_uwb.tight_layout(rect=[0, 0, 1, 0.95])
-        self.fig_uwb.canvas.draw_idle()
 
-        # ── Camera frames (OpenCV) ─────────────────────────────────────
-        if self._show_cameras:
-            # sensor_cam RGB
-            sc = pair.get("sensor_cam")
-            if sc is not None:
-                rgb = load_image(self.data["sensor_cam_rgb_dir"], sc["idx"])
-                if rgb is not None:
-                    label = f"sensor_cam #{sc['idx']}  dt={sc['dt_ms']:.1f}ms"
-                    cv2.setWindowTitle("sensor_cam", label)
-                    cv2.imshow("sensor_cam", rgb)
-
-                depth = load_image(self.data["sensor_cam_depth_dir"], sc["idx"])
-                if depth is not None:
-                    # Normalize 16-bit depth for display
-                    if depth.dtype == np.uint16:
-                        disp = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                        disp = cv2.applyColorMap(disp, cv2.COLORMAP_TURBO)
-                    else:
-                        disp = depth
-                    cv2.imshow("sensor_cam depth", disp)
-
-            # overhead_cam
-            oc = pair.get("overhead_cam")
-            if oc is not None:
-                oh = load_image(self.data["overhead_cam_dir"], oc["idx"])
-                if oh is not None:
-                    label = f"overhead_cam #{oc['idx']}  dt={oc['dt_ms']:.1f}ms"
-                    cv2.setWindowTitle("overhead_cam", label)
-                    cv2.imshow("overhead_cam", oh)
-
-            cv2.waitKey(1)
+        self.fig.suptitle(title, fontsize=12)
+        self.fig.canvas.draw_idle()
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
