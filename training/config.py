@@ -26,7 +26,7 @@ class ModelConfig:
     pretrained_backbone: bool = True  # ImageNet ResNet-18 for RGBD encoder
 
     # SPAD encoder.
-    spad_bins: int = 8
+    spad_bins: int = 128
     spad_spatial: int = 4      # 4 or 8
 
     # UWB encoder.

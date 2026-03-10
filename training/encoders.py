@@ -12,34 +12,45 @@ import torch.nn as nn
 
 class SPADEncoder(nn.Module):
     """
-    Encodes SPAD histogram volumes into a fixed embedding.
+    Encodes SPAD histogram volumes into a fixed embedding using 3-D convolutions.
 
     Input:  (B, H, W, bins) float32 — raw histogram counts.
     Output: (B, embed_dim) float32.
 
-    Treats histogram bins as channels and spatial pixels (4×4 or 8×8)
-    as the 2-D feature map.  AdaptiveAvgPool2d makes it resolution-agnostic.
+    The histogram is treated as a 3-D volume (1, T, H, W) where T is the
+    temporal bin axis and H×W is the spatial pixel grid (4×4 or 8×8).
+    Asymmetric kernels stride aggressively along the long temporal axis
+    while preserving the small spatial dimensions.  AdaptiveAvgPool3d
+    at the end makes the encoder resolution-agnostic.
     """
 
-    def __init__(self, in_bins: int = 8, embed_dim: int = 128):
+    def __init__(self, in_bins: int = 128, embed_dim: int = 128):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_bins, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+        # 3-D conv blocks: (B, 1, T, H, W) → (B, C, T', H', W')
+        # Temporal dim is much larger than spatial (e.g. 128 vs 4),
+        # so we use (t, s, s) kernels with stride only on the temporal axis.
+        self.conv = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=(7, 3, 3), stride=(4, 1, 1), padding=(3, 1, 1)),
+            nn.BatchNorm3d(32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv3d(32, 64, kernel_size=(5, 3, 3), stride=(4, 1, 1), padding=(2, 1, 1)),
+            nn.BatchNorm3d(64),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
+            nn.Conv3d(64, 128, kernel_size=(3, 3, 3), stride=(2, 1, 1), padding=(1, 1, 1)),
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool3d(1),
             nn.Flatten(),
-            nn.Linear(64, embed_dim),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(128, embed_dim),
             nn.ReLU(),
         )
 
     def forward(self, spad: torch.Tensor) -> torch.Tensor:
-        # (B, H, W, bins) → (B, bins, H, W)
-        x = spad.permute(0, 3, 1, 2)
-        return self.net(x)
+        # (B, H, W, bins) → (B, 1, bins, H, W)  — single-channel 3-D volume
+        x = spad.permute(0, 3, 1, 2).unsqueeze(1)
+        return self.head(self.conv(x))
 
 
 class RGBDEncoder(nn.Module):
