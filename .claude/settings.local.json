@@ -16,7 +16,9 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:cmutschler.de)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(C:/Users/lapos/miniconda3/envs/sensor-fusion/python.exe -c \"import numpy as np; d = np.load\\(''C:/Users/lapos/nlos-sensor-fusion/data/logs/2026-03-09/16-33-36/test_data.pkl'', allow_pickle=True\\); print\\(type\\(d\\)\\)\")",
+      "Bash(C:/Users/lapos/miniconda3/envs/sensor-fusion/python.exe -c \"import numpy as np; d = np.load\\(''C:/Users/lapos/nlos-sensor-fusion/data/logs/test5/spad.npz''\\); print\\(''keys:'', list\\(d.files\\)\\); [print\\(f''  {k}: shape={d[k].shape}, dtype={d[k].dtype}''\\) for k in d.files]\")"
     ]
   }
 }
