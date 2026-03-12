@@ -2,17 +2,20 @@
 Offline CIR (Channel Impulse Response) plotter for captured .npz logs.
 
 Modes:
-  step      (default)  Step through frames one at a time.
-  waterfall            Full waterfall heatmap of the entire log.
-  compare              Overlay rx1/rx2/rx3 from one run directory on one plot.
+  step      (default)  Step through frames one at a time (all RX subplots).
+  waterfall            Full waterfall heatmap (all RX subplots).
+
+If given a run directory (or none — auto-detects latest run), all available
+rx1/rx2/rx3 channels are loaded and shown side-by-side.  If given a single
+.npz file, only that channel is shown.
 
 Usage:
-  python uwb_cir_plotter.py                              # auto-detect latest log, step mode
-  python uwb_cir_plotter.py path/to/cir.npz              # explicit log, step mode
-  python uwb_cir_plotter.py --waterfall                  # waterfall of latest log
-  python uwb_cir_plotter.py path/to/cir.npz --waterfall
-  python uwb_cir_plotter.py --compare                    # compare rx1/rx2/rx3, latest run
-  python uwb_cir_plotter.py --compare path/to/run/dir/  # compare explicit run directory
+  python uwb_cir_plotter.py                              # latest run, step mode
+  python uwb_cir_plotter.py path/to/run_dir/             # explicit run dir
+  python uwb_cir_plotter.py path/to/rx1.npz              # single file
+  python uwb_cir_plotter.py --waterfall                  # latest run, waterfall
+  python uwb_cir_plotter.py path/to/run_dir/ --waterfall
+  python uwb_cir_plotter.py --compare path/to/run_dir/   # (legacy alias for step)
 """
 
 import argparse
@@ -29,20 +32,6 @@ RX_COLORS  = ("steelblue", "tomato", "seagreen")
 
 
 # ── Load ───────────────────────────────────────────────────────────────────
-
-def find_latest_log() -> Path:
-    # Prefer resp.npz in run subdirs (data/uwb/logs/<run>/resp.npz)
-    resp_logs = sorted(LOGDIR.glob("*/resp.npz"), key=lambda p: p.stat().st_mtime)
-    # Fallback: legacy cir_*.npz in LOGDIR root
-    legacy_logs = sorted(LOGDIR.glob("*.npz"), key=lambda p: p.stat().st_mtime)
-    logs = resp_logs or legacy_logs
-    if not logs:
-        print(f"No .npz files found in {LOGDIR}. Run capture_uwb.py first.")
-        sys.exit(1)
-    path = logs[-1]
-    print(f"Auto-detected: {path}")
-    return path
-
 
 def find_latest_run() -> Path:
     runs = sorted(
@@ -67,7 +56,8 @@ def load_log(path: Path) -> dict:
 
     print(f"Loaded {n} frames from {path}")
     print(f"Zero I/Q pairs per frame (min/mean/max): "
-          f"{zero_pairs.min()} / {zero_pairs.mean():.1f} / {zero_pairs.max()} out of {N_SAMPLES}")
+          f"{zero_pairs.min()} / {zero_pairs.mean():.1f} / {zero_pairs.max()} "
+          f"out of {N_SAMPLES}")
 
     for i in range(min(5, n)):
         print(f"  frame {i}: {zero_pairs[i]} zero taps")
@@ -85,181 +75,92 @@ def load_log(path: Path) -> dict:
     }
 
 
-# ── Step-through plotter ─────────────────────────────────────────────────────
-
-def plot_step(log: dict):
-    cir_mag_all = log["cir_mag"]
-    seq_all     = log["seq"]
-    fp_all     = log["fp_index"]
-    rxpacc_all = log["rxpacc"]
-    ts_all     = log["timestamp"]
-    n = cir_mag_all.shape[0]
-
-    fig, ax = plt.subplots(figsize=(13, 5))
-    fig.suptitle("CIR Log — Step Through (magnitude)", fontsize=13)
-
-    sample_axis = np.arange(N_SAMPLES)
-    mag = np.roll(cir_mag_all[0], -int(fp_all[0]))
-
-    (line,)   = ax.plot(sample_axis, mag, lw=0.8, color="steelblue")
-    fp_line   = ax.axvline(x=0, color="red",    lw=1.5, ls="--", label="First path (index 0)")
-    peak_line = ax.axvline(x=0, color="orange", lw=1.5, ls=":",  label="Peak")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.set_xlim(0, N_SAMPLES - 1)
-    ax.set_xlabel("Sample index relative to first path")
-    ax.set_ylabel("Normalised magnitude")
-    ax.grid(True, alpha=0.3)
-
-    info_text = ax.text(
-        0.01, 0.95, "", transform=ax.transAxes,
-        fontsize=8, va="top", family="monospace",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    )
-
-    state = {"idx": 0}
-
-    def draw_frame(i):
-        fp  = int(fp_all[i])
-        mag = np.roll(cir_mag_all[i], -fp)
-        peak_idx = int(np.argmax(mag))
-        fp_peak_ratio = mag[0] / (mag[peak_idx] + 1e-9)
-
-        line.set_ydata(mag)
-        ax.set_ylim(0, mag.max() * 1.15 + 1e-6)
-        fp_line.set_xdata([0, 0])
-        peak_line.set_xdata([peak_idx, peak_idx])
-
-        info_text.set_text(
-            f"frame {i}/{n-1}  seq={seq_all[i]}  t={ts_all[i]:.3f}s\n"
-            f"fp={fp}  peak={peak_idx}  rxpacc={rxpacc_all[i]}\n"
-            f"FP/peak={fp_peak_ratio:.3f}"
-        )
-        fig.canvas.draw_idle()
-
-    def on_key(event):
-        if event.key in ("enter", "right", " ", "."):
-            state["idx"] = min(state["idx"] + 1, n - 1)
-        elif event.key in ("left", ","):
-            state["idx"] = max(state["idx"] - 1, 0)
-        elif event.key == "home":
-            state["idx"] = 0
-        elif event.key == "end":
-            state["idx"] = n - 1
-        elif event.key in ("q", "escape"):
-            plt.close(fig)
-            return
-        else:
-            return
-        draw_frame(state["idx"])
-
-    fig.canvas.mpl_connect("key_press_event", on_key)
-    draw_frame(0)
-
-    print(f"\n  Right/Enter/Space = next    Left = prev")
-    print(f"  Home = first    End = last    q/Esc = quit\n")
-
-    plt.tight_layout()
-    plt.show()
-
-
-# ── Waterfall plotter ────────────────────────────────────────────────────────
-
-def plot_waterfall(log: dict):
-    cir_mag_all = log["cir_mag"]
-    fp_all      = log["fp_index"]
-    ts_all = log["timestamp"]
-    n = cir_mag_all.shape[0]
-
-    mag_all = np.array([np.roll(cir_mag_all[i], -int(fp_all[i])) for i in range(n)])
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    fig.suptitle(f"CIR Waterfall — {n} frames", fontsize=13)
-
-    img = ax.imshow(
-        mag_all, aspect="auto", origin="upper",
-        extent=[0, N_SAMPLES - 1, n, 0],
-        cmap="inferno", interpolation="nearest",
-    )
-    fig.colorbar(img, ax=ax, label="Normalised magnitude")
-
-    ax.axvline(x=0, color="cyan", lw=0.8, alpha=0.7, label="First path (index 0)")
-    ax.legend(loc="upper right", fontsize=8)
-
-    ax.set_xlabel("Sample index relative to first path")
-    ax.set_ylabel("Frame")
-    ax.grid(False)
-
-    plt.tight_layout()
-    plt.show()
-
-
-# ── Multi-RX compare plotter ─────────────────────────────────────────────────
-
-def plot_compare(run_dir: Path):
-    """Overlay CIR magnitude from rx1/rx2/rx3 for the same frame index."""
+def load_run(run_dir: Path) -> "dict[str, dict]":
+    """Load all available RX logs from a run directory."""
     logs = {}
     for role in RX_ROLES:
         path = run_dir / f"{role}.npz"
         if not path.exists():
-            print(f"  {role}.npz not found — skipping")
             continue
         data = np.load(path)
         logs[role] = {
-            "cir_mag":  data["cir_mag"] if "cir_mag" in data else np.abs(data["cir"]),
-            "fp_index": data["fp_index"],
-            "seq":      data["seq"],
+            "cir_mag":   data["cir_mag"] if "cir_mag" in data else np.abs(data["cir"]),
+            "fp_index":  data["fp_index"],
+            "seq":       data["seq"],
+            "rxpacc":    data["rxpacc"] if "rxpacc" in data else np.zeros(data["cir"].shape[0], dtype=np.uint16),
             "timestamp": data["timestamp"],
         }
         print(f"  {role}: {logs[role]['cir_mag'].shape[0]} frames")
+    return logs
 
-    if not logs:
-        print("No RX npz files found.")
-        sys.exit(1)
 
-    n_frames = min(v["cir_mag"].shape[0] for v in logs.values())
+# ── Step-through plotter (multi-RX) ──────────────────────────────────────────
+
+def plot_step(logs: "dict[str, dict]", title: str = ""):
+    """Step through frames with one subplot per RX channel."""
+    roles = [r for r in RX_ROLES if r in logs]
+    n_rx = len(roles)
+    n_frames = min(logs[r]["cir_mag"].shape[0] for r in roles)
     sample_axis = np.arange(N_SAMPLES)
 
-    fig, ax = plt.subplots(figsize=(13, 5))
-    fig.suptitle(f"CIR Compare — {', '.join(logs.keys())} — {run_dir.name}", fontsize=12)
+    fig, axes = plt.subplots(n_rx, 1, figsize=(14, 4 * n_rx), sharex=True)
+    if n_rx == 1:
+        axes = [axes]
+    fig.suptitle(title or "CIR Step Through", fontsize=13)
 
     lines = {}
     fp_lines = {}
-    for role, color in zip(RX_ROLES, RX_COLORS):
-        if role not in logs:
-            continue
-        mag = np.roll(logs[role]["cir_mag"][0], -int(logs[role]["fp_index"][0]))
-        (line,) = ax.plot(sample_axis, mag, lw=0.9, color=color, label=role, alpha=0.85)
-        fp_line = ax.axvline(x=0, color=color, lw=1.2, ls="--", alpha=0.5)
+    peak_lines = {}
+    info_texts = {}
+
+    for ax, role, color in zip(axes, roles, RX_COLORS):
+        mag = logs[role]["cir_mag"][0]
+        fp = int(logs[role]["fp_index"][0])
+        peak = int(np.argmax(mag))
+
+        (line,) = ax.plot(sample_axis, mag, lw=0.8, color=color, label=role)
+        fp_line = ax.axvline(x=fp, color=color, lw=1.2, ls="--", alpha=0.6,
+                             label="First path")
+        peak_line = ax.axvline(x=peak, color="orange", lw=1.2, ls=":",
+                               alpha=0.6, label="Peak")
+        ax.set_ylabel(role, fontsize=11, fontweight="bold")
+        ax.set_xlim(0, N_SAMPLES - 1)
+        ax.grid(True, alpha=0.3)
+        if ax is axes[0]:
+            ax.legend(loc="upper right", fontsize=8)
+
+        info = ax.text(
+            0.99, 0.95, "", transform=ax.transAxes,
+            fontsize=8, va="top", ha="right", family="monospace",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
         lines[role] = line
         fp_lines[role] = fp_line
+        peak_lines[role] = peak_line
+        info_texts[role] = info
 
-    ax.set_xlim(0, N_SAMPLES - 1)
-    ax.set_xlabel("Sample index relative to first path")
-    ax.set_ylabel("Magnitude")
-    ax.legend(loc="upper right", fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    info_text = ax.text(
-        0.01, 0.95, "", transform=ax.transAxes,
-        fontsize=8, va="top", family="monospace",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    )
+    axes[-1].set_xlabel("Sample index")
 
     state = {"idx": 0}
 
     def draw_frame(i):
-        parts = [f"frame {i}/{n_frames - 1}"]
-        y_max = 0.0
-        for role in logs:
-            fp  = int(logs[role]["fp_index"][i])
-            mag = np.roll(logs[role]["cir_mag"][i], -fp)
+        for ax, role in zip(axes, roles):
+            log = logs[role]
+            mag = log["cir_mag"][i]
+            fp = int(log["fp_index"][i])
+            peak = int(np.argmax(mag))
+            fp_peak_ratio = mag[fp] / (mag[peak] + 1e-9)
+
             lines[role].set_ydata(mag)
-            fp_lines[role].set_xdata([0, 0])
-            y_max = max(y_max, mag.max())
-            parts.append(f"{role}: fp={fp}  seq={logs[role]['seq'][i]}  "
-                         f"t={logs[role]['timestamp'][i]:.3f}s")
-        ax.set_ylim(0, y_max * 1.15 + 1e-6)
-        info_text.set_text("\n".join(parts))
+            ax.set_ylim(0, float(mag.max()) * 1.15 + 1e-6)
+            fp_lines[role].set_xdata([fp, fp])
+            peak_lines[role].set_xdata([peak, peak])
+            info_texts[role].set_text(
+                f"frame {i}/{n_frames-1}  seq={log['seq'][i]}  "
+                f"t={log['timestamp'][i]:.3f}s\n"
+                f"fp={fp}  peak={peak}  rxpacc={log['rxpacc'][i]}  "
+                f"FP/peak={fp_peak_ratio:.3f}"
+            )
         fig.canvas.draw_idle()
 
     def on_key(event):
@@ -288,43 +189,100 @@ def plot_compare(run_dir: Path):
     plt.show()
 
 
+# ── Waterfall plotter (multi-RX) ────────────────────────────────────────────
+
+def plot_waterfall(logs: "dict[str, dict]", title: str = ""):
+    """Waterfall heatmap with one subplot per RX channel."""
+    roles = [r for r in RX_ROLES if r in logs]
+    n_rx = len(roles)
+
+    fig, axes = plt.subplots(n_rx, 1, figsize=(14, 5 * n_rx), sharex=True)
+    if n_rx == 1:
+        axes = [axes]
+    fig.suptitle(title or "CIR Waterfall", fontsize=13)
+
+    for ax, role, color in zip(axes, roles, RX_COLORS):
+        log = logs[role]
+        cir_mag = log["cir_mag"]
+        fp_all = log["fp_index"]
+        n = cir_mag.shape[0]
+
+        fp_line = ax.axvline(x=0, color="cyan", lw=0.8, ls="--", alpha=0.0)
+
+        img = ax.imshow(
+            cir_mag, aspect="auto", origin="upper",
+            extent=[0, N_SAMPLES - 1, n, 0],
+            cmap="inferno", interpolation="nearest",
+        )
+        fig.colorbar(img, ax=ax, label="Magnitude", shrink=0.8)
+
+        # Overlay FP trace as a scatter/line
+        ax.plot(fp_all, np.arange(n), color="cyan", lw=0.6, alpha=0.7,
+                label="First path")
+
+        ax.set_ylabel(f"{role}\nFrame", fontsize=10, fontweight="bold")
+        ax.set_xlim(0, N_SAMPLES - 1)
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(False)
+
+        ax.text(0.99, 0.02, f"{n} frames", transform=ax.transAxes,
+                fontsize=8, ha="right", va="bottom", color="white",
+                bbox=dict(boxstyle="round", facecolor="black", alpha=0.5))
+
+    axes[-1].set_xlabel("Sample index")
+
+    plt.tight_layout()
+    plt.show()
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot CIR data from a captured .npz log")
+    parser = argparse.ArgumentParser(
+        description="Plot CIR data from captured .npz logs")
     parser.add_argument("path", nargs="?",
-                        help="Path to .npz log or run directory (auto-detects latest if omitted)")
+                        help="Run directory or single .npz file "
+                             "(auto-detects latest run if omitted)")
     parser.add_argument("--waterfall", action="store_true",
-                        help="Show full waterfall instead of step-through")
+                        help="Show waterfall heatmap instead of step-through")
     parser.add_argument("--compare", action="store_true",
-                        help="Overlay rx1/rx2/rx3 from a run directory on one plot")
+                        help="(Legacy) same as default step-through on a run dir")
     args = parser.parse_args()
 
-    if args.compare:
-        if args.path:
-            run_dir = Path(args.path)
-            if not run_dir.is_dir():
-                print(f"Error: {run_dir} is not a directory.")
-                sys.exit(1)
-        else:
-            run_dir = find_latest_run()
-        plot_compare(run_dir)
-        return
-
+    # ── Resolve path → either a run dir with multiple RX, or a single file ──
     if args.path:
         path = Path(args.path)
         if not path.exists():
             print(f"Error: {path} does not exist.")
             sys.exit(1)
+        if path.is_dir():
+            run_dir = path
+        else:
+            run_dir = None  # single file
     else:
-        path = find_latest_log()
+        run_dir = find_latest_run()
+        path = None
 
-    log = load_log(path)
+    # ── Load ──
+    if run_dir is not None:
+        print(f"Loading from {run_dir}:")
+        logs = load_run(run_dir)
+        if not logs:
+            print("No RX .npz files found in directory.")
+            sys.exit(1)
+        title_suffix = f" — {run_dir.name}"
+    else:
+        # Single .npz file
+        log = load_log(path)
+        role = path.stem if path.stem in RX_ROLES else "rx"
+        logs = {role: log}
+        title_suffix = f" — {path.name}"
 
+    # ── Plot ──
     if args.waterfall:
-        plot_waterfall(log)
+        plot_waterfall(logs, title=f"CIR Waterfall{title_suffix}")
     else:
-        plot_step(log)
+        plot_step(logs, title=f"CIR Step Through{title_suffix}")
 
 
 if __name__ == "__main__":
