@@ -23,6 +23,7 @@ import sys
 import time
 import threading
 from pathlib import Path
+import shutil
 from datetime import datetime
 
 print("[full_capture] Starting...", flush=True)
@@ -374,6 +375,28 @@ def _join_workers(stop: threading.Event, threads: list[threading.Thread]):
         t.join(timeout=3.0)
 
 
+# ── Sensor Health ─────────────────────────────────────────────────────
+
+_STALE_WARN_THRESHOLD = 30  # consecutive iterations before warning
+
+
+def _check_fresh(name, data, ts, miss, last_ts):
+    """Return True if sensor data is fresh (should be written).
+
+    Increments *miss[name]* on None or stale reads, resets on fresh data.
+    Prints a bold warning once when the threshold is crossed.
+    """
+    if data is None or (ts is not None and ts == last_ts.get(name)):
+        miss[name] = miss.get(name, 0) + 1
+        if miss[name] == _STALE_WARN_THRESHOLD:
+            _log(f"\033[1;31m[WARNING] {name}: {miss[name]} consecutive "
+                 f"stale/empty frames — sensor may have stopped\033[0m")
+        return False
+    miss[name] = 0
+    last_ts[name] = ts
+    return True
+
+
 # ── Display (main-thread only) ────────────────────────────────────────
 
 def _update_display(manager: Manager, idx: int,
@@ -443,6 +466,8 @@ def run_loop(
 
     idx = 0
     t0 = time.perf_counter()
+    miss: dict[str, int] = {}
+    seen_ts: dict[str, object] = {}
 
     try:
         while not stop.is_set():
@@ -466,7 +491,7 @@ def run_loop(
                     spad_data, spad_ts = paced, paced_ts
                 else:
                     spad_data, spad_ts = spad_buf.get()
-                if spad_data is not None:
+                if _check_fresh("spad", spad_data, spad_ts, miss, seen_ts):
                     writer.write_spad(spad_data, spad_ts)
 
             if cfg.USE_SENSOR_CAM:
@@ -474,7 +499,7 @@ def run_loop(
                     sensor_cam_data, sensor_cam_ts = paced, paced_ts
                 else:
                     sensor_cam_data, sensor_cam_ts = sensor_cam_buf.get()
-                if sensor_cam_data is not None:
+                if _check_fresh("sensor_cam", sensor_cam_data, sensor_cam_ts, miss, seen_ts):
                     writer.write_sensor_cam(sensor_cam_data, sensor_cam_ts)
 
             if cfg.USE_OVERHEAD_CAM:
@@ -482,7 +507,7 @@ def run_loop(
                     overhead_cam_data, overhead_cam_ts = paced, paced_ts
                 else:
                     overhead_cam_data, overhead_cam_ts = overhead_cam_buf.get()
-                if overhead_cam_data is not None:
+                if _check_fresh("overhead_cam", overhead_cam_data, overhead_cam_ts, miss, seen_ts):
                     writer.write_overhead_cam(overhead_cam_data, overhead_cam_ts)
 
             _update_display(manager, idx, spad_data, sensor_cam_data,
@@ -523,6 +548,8 @@ def run_manual(
     time.sleep(0.5)
 
     idx = 0
+    miss: dict[str, int] = {}
+    seen_ts: dict[str, object] = {}
     try:
         while not stop.is_set():
             pump_qt()
@@ -534,24 +561,24 @@ def run_manual(
 
             if cfg.USE_SPAD:
                 spad_data, spad_ts = spad_buf.get()
-                if spad_data is not None:
+                if _check_fresh("spad", spad_data, spad_ts, miss, seen_ts):
                     writer.write_spad(spad_data, spad_ts)
                 else:
-                    _log("Warning: no SPAD data yet")
+                    _log("Warning: no fresh SPAD data")
 
             if cfg.USE_SENSOR_CAM:
                 sensor_cam_data, sensor_cam_ts = sensor_cam_buf.get()
-                if sensor_cam_data is not None:
+                if _check_fresh("sensor_cam", sensor_cam_data, sensor_cam_ts, miss, seen_ts):
                     writer.write_sensor_cam(sensor_cam_data, sensor_cam_ts)
                 else:
-                    _log("Warning: no sensor_cam data yet")
+                    _log("Warning: no fresh sensor_cam data")
 
             if cfg.USE_OVERHEAD_CAM:
                 overhead_cam_data, overhead_cam_ts = overhead_cam_buf.get()
-                if overhead_cam_data is not None:
+                if _check_fresh("overhead_cam", overhead_cam_data, overhead_cam_ts, miss, seen_ts):
                     writer.write_overhead_cam(overhead_cam_data, overhead_cam_ts)
                 else:
-                    _log("Warning: no overhead_cam data yet")
+                    _log("Warning: no fresh overhead_cam data")
 
             _update_display(manager, idx, spad_data, sensor_cam_data,
                             overhead_cam_data, cir_state)
@@ -586,6 +613,10 @@ def main():
 
     logdir = Path("data/logs") / run_name
     logdir.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(logdir).free / (1 << 30)
+    if free_gb < 10:
+        _log(f"\033[1;33m[WARNING] Only {free_gb:.1f} GB free on {logdir.resolve().drive}\\ "
+             f"— capture may fill disk\033[0m")
     _log(f"  output = {logdir}")
 
     # ── Shared events ─────────────────────────────────────────────────

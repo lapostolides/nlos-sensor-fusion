@@ -164,9 +164,19 @@ class RunWriter:
                 "timestamps": self._overhead_cam_timestamps,
             }
 
+        end_time = datetime.now().isoformat()
+        start_iso = self._metadata.get("start_time")
+        if start_iso:
+            dt = datetime.fromisoformat(end_time) - datetime.fromisoformat(start_iso)
+            duration_s = dt.total_seconds()
+        else:
+            duration_s = None
+
         manifest = {
             "format_version": 1,
             **self._metadata,
+            "end_time": end_time,
+            "duration_s": duration_s,
             "frames": frames,
         }
 
